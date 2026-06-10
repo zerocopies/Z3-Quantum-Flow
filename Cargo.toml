@@ -1,0 +1,30 @@
+[package]
+name        = "z1"
+version     = "0.1.0"
+edition     = "2021"
+description = "Z.1 — streaming large-model inference engine with mmap + llama.cpp"
+
+[[bin]]
+name = "z1"
+path = "src/main.rs"
+
+[dependencies]
+libc        = "0.2"
+anyhow      = "1.0"
+log         = "0.4"
+env_logger  = "0.11"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+rand        = "0.8"          # proper RNG for the sampler
+
+[build-dependencies]
+cc = "1.0"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto       = true
