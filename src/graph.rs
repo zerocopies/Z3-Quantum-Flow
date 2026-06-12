@@ -210,11 +210,6 @@ impl LlamaGraph {
         let hp      = LlamaHparams::from_model(model);
         let backend = unsafe { ffi::ggml_backend_cpu_init() };
         if backend.is_null() { bail!("[Z.1 Graph] ggml_backend_cpu_init failed"); }
-        let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get() as c_int)
-        .unwrap_or(4);
-        unsafe { ffi::ggml_backend_cpu_set_n_threads(backend, 2); }
-        log::info!("[Z.1 Graph] threads={}", n_threads);
         log::info!("[Z.1 Graph] layers={} embd={} heads={}/{} ff={} rot={} freq_base={}",
             hp.n_layer, hp.n_embd, hp.n_head, hp.n_head_kv, hp.n_ff, hp.n_rot, hp.freq_base);
         // Pass backend so KV tensors land in a backend-registered buffer
@@ -498,6 +493,19 @@ impl LlamaGraph {
         let mut out = vec![0.0f32; n_vocab];
         unsafe { ffi::ggml_backend_tensor_get(self.d_logits,
             out.as_mut_ptr() as *mut c_void, 0, n_vocab * 4); }
+
+        // ── DIAGNOSTIC: decode step state + argmax ────────────────────────────
+        {
+            let (amax, mval) = out.iter().enumerate()
+                .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+            // First few elements of mask, to verify it's not all -10000
+            let mut mask_sample = vec![0.0f32; 4];
+            unsafe { ffi::ggml_backend_tensor_get(self.d_mask,
+                mask_sample.as_mut_ptr() as *mut c_void, 0, 16); }
+            eprintln!("[Z.1 DIAG] decode: token_in={} kv_head={} pos={} new_kv_head={} mask[0..4]={:?} argmax={} val={:.3}",
+                tok, kv_head, pos, self.kv.head, mask_sample, amax, mval);
+        }
+
         Ok(out)
     }
 
@@ -701,6 +709,14 @@ impl LlamaGraph {
         unsafe {
             ffi::ggml_backend_tensor_get(logits,
                 out.as_mut_ptr() as *mut c_void, 0, n_vocab * 4);
+        }
+
+        // ── DIAGNOSTIC: argmax of prefill output ──────────────────────────────
+        {
+            let (amax, mval) = out.iter().enumerate()
+                .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+            eprintln!("[Z.1 DIAG] prefill done: kv_head_before={} kv_len={} new_kv_head={} argmax={} val={:.3}",
+                kv_head, kv_len, self.kv.head, amax, mval);
         }
 
         unsafe {
