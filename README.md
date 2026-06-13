@@ -46,6 +46,18 @@ Why 2 threads beats 4 on this CPU: the workload is memory-bandwidth bound, not c
 
 ---
 
+## Prerequisites
+
+- **Rust** (stable) — install via [rustup](https://rustup.rs)
+- **A C compiler** (`gcc` or `clang`) — needed to compile the vendored ggml C sources. On Debian/Ubuntu: `sudo apt install build-essential`. On macOS: Xcode Command Line Tools (`xcode-select --install`).
+- **A GGUF model file** — this project was built and tested against `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`. Model files are large (~4.5 GiB) and not included in this repo. Download from Hugging Face, e.g.:
+  ```
+  https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
+  ```
+  (look for the `Q4_K_M` quantization). Any Llama 3.1 8B Instruct GGUF in `Q4_K_M` should work; other quantizations of the same model will also load but haven't been benchmarked here.
+
+---
+
 ## Building
 
 Requires Rust (stable) and a C/C++ toolchain (the vendored ggml/llama.cpp C sources are compiled as part of the build).
