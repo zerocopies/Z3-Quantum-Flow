@@ -9,6 +9,13 @@
 //                       already supports this).
 
 use std::io::{self, Write};
+use std::sync::OnceLock;
+
+/// Returns true if Z1_TRACE=1 is set in the environment. Cached after first call.
+fn trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("Z1_TRACE").map(|v| v == "1").unwrap_or(false))
+}
 use std::time::Instant;
 
 use crate::graph::{ForwardPass, ForwardError};
@@ -152,7 +159,7 @@ fn run_generation_inner(
 
     let prompt_t0 = Instant::now();
 
-    if !quiet {
+    if !quiet && trace_enabled() {
         eprint!("[Z.1 DEBUG] turn tokens ({}): ", turn_ids.len());
         for id in turn_ids.iter() { eprint!("{} ", id); }
         eprintln!();
@@ -166,7 +173,7 @@ fn run_generation_inner(
     let mut rng = rng_seed_from_time();
     let mut recent_tokens: Vec<u32> = Vec::new();
     let mut next_token = sample_token(&mut logits, &cfg.sampling, &recent_tokens, &mut rng)?;
-    if !quiet {
+    if !quiet && trace_enabled() {
         eprintln!("[Z.1 DEBUG] first token id: {} decode: {:?}", next_token, tok.decode_one(next_token));
     }
 

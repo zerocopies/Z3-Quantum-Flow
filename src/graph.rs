@@ -8,6 +8,15 @@
 /// ggml_cpy (prefill) and ggml_backend_tensor_set (decode) can write to them.
 
 use std::ffi::c_void;
+use std::sync::OnceLock;
+
+/// Returns true if Z1_TRACE=1 is set in the environment. Cached after first call.
+/// Gates the [Z.1 DIAG] per-token diagnostic prints — useful during debugging,
+/// noisy for normal runs and benchmarks.
+fn trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("Z1_TRACE").map(|v| v == "1").unwrap_or(false))
+}
 use std::fmt;
 use libc::c_int;
 
@@ -494,8 +503,8 @@ impl LlamaGraph {
         unsafe { ffi::ggml_backend_tensor_get(self.d_logits,
             out.as_mut_ptr() as *mut c_void, 0, n_vocab * 4); }
 
-        // ── DIAGNOSTIC: decode step state + argmax ────────────────────────────
-        {
+        // ── DIAGNOSTIC: decode step state + argmax (Z1_TRACE=1) ────────────────
+        if trace_enabled() {
             let (amax, mval) = out.iter().enumerate()
                 .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
             // First few elements of mask, to verify it's not all -10000
@@ -711,8 +720,8 @@ impl LlamaGraph {
                 out.as_mut_ptr() as *mut c_void, 0, n_vocab * 4);
         }
 
-        // ── DIAGNOSTIC: argmax of prefill output ──────────────────────────────
-        {
+        // ── DIAGNOSTIC: argmax of prefill output (Z1_TRACE=1) ───────────────────
+        if trace_enabled() {
             let (amax, mval) = out.iter().enumerate()
                 .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
             eprintln!("[Z.1 DIAG] prefill done: kv_head_before={} kv_len={} new_kv_head={} argmax={} val={:.3}",
