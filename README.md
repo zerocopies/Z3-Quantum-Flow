@@ -156,11 +156,9 @@ Inference Z1 builds the decode graph **once**, with the KV cache and a fixed-siz
 
 ## License
 
-[Choose and confirm — see note below]
+MIT — see [LICENSE](LICENSE).
 
-This project vendors ggml/llama.cpp sources (MIT licensed) for the underlying tensor operations and C build. Inference Z1's own Rust code (loader, graph construction, KV cache, tokenizer, generation loop, CLI) is original work.
-
-> **Note:** confirm your chosen license here before publishing, and ensure attribution to the vendored llama.cpp/ggml project (MIT) is correct and complete.
+This project vendors ggml/llama.cpp (unmodified, tag b3534) for the underlying tensor operations and C build — also MIT licensed, with full attribution in the LICENSE file. Inference Z1's own Rust code (loader, graph construction, KV cache, tokenizer, generation loop, CLI, dev harness) is original work.
 
 ---
 
