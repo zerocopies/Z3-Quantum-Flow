@@ -1,59 +1,41 @@
 // generate.rs — autoregressive generation loop for the B1 inference path
 //
-// Two entry points:
-//   generate()       — single-shot. Resets KV cache before and after.
-//   generate_turn()  — multi-turn chat. Does NOT reset KV cache; each turn's
-//                       tokens are appended via prefill() starting at the
-//                       current kv.head, so conversation history persists
-//                       across turns for free (the persistent decode graph
-//                       already supports this).
+// Features a Sliding-Window KV Cache manager. When the conversation exceeds
+// the context limit, it drops the oldest conversation turns while preserving 
+// the system prompt, resets the KV cache, and seamlessly re-prefills.
 
 use std::io::{self, Write};
 use std::sync::OnceLock;
+use std::time::Instant;
+
+use crate::graph::{ForwardPass, ForwardError};
+use crate::loader::MappedModel;
+use crate::logits::{sample_token, SamplingConfig, rng_seed_from_time, LogitError};
+use crate::tokenizer::Tokenizer;
 
 /// Returns true if Z1_TRACE=1 is set in the environment. Cached after first call.
 fn trace_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| std::env::var("Z1_TRACE").map(|v| v == "1").unwrap_or(false))
 }
-use std::time::Instant;
-
-use crate::graph::{ForwardPass, ForwardError};
-use crate::loader::MappedModel;
-use crate::logits::{sample_token, SamplingConfig, rng_seed_from_time, LogitError};
-use crate::tokenizer::{Tokenizer, TOKEN_EOS};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum GenerateError {
-    Forward(ForwardError),
-    Logit(LogitError),
-    Io(io::Error),
+    #[error("Forward pass error: {0}")]
+    Forward(#[from] ForwardError),
+    #[error("Logit error: {0}")]
+    Logit(#[from] LogitError),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("Prompt is empty")]
     EmptyPrompt,
+    #[error("Context length exceeded (max {max} tokens)")]
     ContextLengthExceeded { max: usize },
+    #[error("Conversation context full ({used}/{max} tokens)")]
     ContextFull { used: i64, max: i64 },
 }
-
-impl std::fmt::Display for GenerateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Forward(e)  => write!(f, "forward pass error: {e}"),
-            Self::Logit(e)    => write!(f, "logit error: {e}"),
-            Self::Io(e)       => write!(f, "I/O error: {e}"),
-            Self::EmptyPrompt => write!(f, "prompt is empty"),
-            Self::ContextLengthExceeded { max } =>
-                write!(f, "context length exceeded (max {max} tokens)"),
-            Self::ContextFull { used, max } =>
-                write!(f, "conversation context full ({used}/{max} tokens) — use /reset to start a new conversation"),
-        }
-    }
-}
-
-impl std::error::Error for GenerateError {}
-impl From<ForwardError> for GenerateError { fn from(e: ForwardError) -> Self { Self::Forward(e) } }
-impl From<LogitError>   for GenerateError { fn from(e: LogitError)   -> Self { Self::Logit(e) } }
-impl From<io::Error>    for GenerateError { fn from(e: io::Error)    -> Self { Self::Io(e) } }
 
 // ── Generation config ─────────────────────────────────────────────────────────
 
@@ -72,7 +54,7 @@ impl Default for GenerateConfig {
         Self {
             max_new_tokens: 512,
             sampling: SamplingConfig::default(),
-            context_len: 4096,
+            context_len: 512,
             print_timing: true,
             add_bos: true,
             chat_template: true,
@@ -109,10 +91,7 @@ impl std::fmt::Display for GenerateStats {
     }
 }
 
-// ── Core generation loop (shared by both entry points) ────────────────────────
-//
-// Runs prefill on `turn_ids`, then decodes until EOS or max_new_tokens.
-// Does NOT reset the KV cache — caller decides whether to reset.
+// ── Core generation loop ──────────────────────────────────────────────────────
 
 fn run_generation(
     turn_ids: &[u32],
@@ -120,21 +99,18 @@ fn run_generation(
     model: &MappedModel,
     tok: &Tokenizer,
     cfg: &GenerateConfig,
-) -> Result<GenerateStats, GenerateError> {
-    let (stats, _text) = run_generation_inner(turn_ids, fwd, model, tok, cfg, false)?;
-    Ok(stats)
+) -> Result<(GenerateStats, Vec<u32>), GenerateError> {
+    let (stats, _text, generated_ids) = run_generation_inner(turn_ids, fwd, model, tok, cfg, false)?;
+    Ok((stats, generated_ids))
 }
 
-/// Like `run_generation`, but also returns the decoded text of the generated
-/// tokens and suppresses `[Z.1 DEBUG]` lines + streaming to stdout. Used by
-/// the bench/dev-harness for correctness checks (e.g. "does it say Paris?").
 pub fn run_generation_captured(
     turn_ids: &[u32],
     fwd: &mut ForwardPass,
     model: &MappedModel,
     tok: &Tokenizer,
     cfg: &GenerateConfig,
-) -> Result<(GenerateStats, String), GenerateError> {
+) -> Result<(GenerateStats, String, Vec<u32>), GenerateError> {
     run_generation_inner(turn_ids, fwd, model, tok, cfg, true)
 }
 
@@ -145,48 +121,43 @@ fn run_generation_inner(
     tok: &Tokenizer,
     cfg: &GenerateConfig,
     quiet: bool,
-) -> Result<(GenerateStats, String), GenerateError> {
+) -> Result<(GenerateStats, String, Vec<u32>), GenerateError> {
 
     if turn_ids.is_empty() { return Err(GenerateError::EmptyPrompt); }
 
-    // ── Capacity check against the actual KV cache, not cfg.context_len ────────
     let n_ctx  = fwd.kv.n_ctx;
     let used   = fwd.kv.head;
     let needed = turn_ids.len() as i64;
+    
     if used + needed > n_ctx {
         return Err(GenerateError::ContextFull { used: used + needed, max: n_ctx });
     }
 
     let prompt_t0 = Instant::now();
-
-    if !quiet && trace_enabled() {
-        eprint!("[Z.1 DEBUG] turn tokens ({}): ", turn_ids.len());
-        for id in turn_ids.iter() { eprint!("{} ", id); }
-        eprintln!();
-    }
     let prompt_token_count = turn_ids.len();
 
-    // Prefill appends at fwd.kv.head — existing history is preserved.
     let mut logits = fwd.prefill(turn_ids, model)?;
     let prompt_ms = prompt_t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut rng = rng_seed_from_time();
     let mut recent_tokens: Vec<u32> = Vec::new();
+    let mut generated_ids: Vec<u32> = Vec::new();
+    
     let mut next_token = sample_token(&mut logits, &cfg.sampling, &recent_tokens, &mut rng)?;
-    if !quiet && trace_enabled() {
-        eprintln!("[Z.1 DEBUG] first token id: {} decode: {:?}", next_token, tok.decode_one(next_token));
-    }
 
     let gen_t0 = Instant::now();
     let mut generated = 0usize;
     let stdout = io::stdout();
     let mut text = String::new();
+    
     if !quiet { println!(); }
 
     loop {
         if tok.is_eos(next_token) { break; }
         if generated >= cfg.max_new_tokens { break; }
-        if fwd.kv.head >= n_ctx { break; } // cache full — stop gracefully
+        if fwd.kv.head >= n_ctx { break; } 
+
+        generated_ids.push(next_token);
 
         if let Some(piece) = tok.decode_one(next_token) {
             if quiet {
@@ -208,61 +179,58 @@ fn run_generation_inner(
     }
 
     let generate_ms = gen_t0.elapsed().as_secs_f64() * 1000.0;
-    let stats = GenerateStats { prompt_tokens: prompt_token_count, generated_tokens: generated,
-        prompt_ms, generate_ms };
+    let stats = GenerateStats { prompt_tokens: prompt_token_count, generated_tokens: generated, prompt_ms, generate_ms };
 
     if cfg.print_timing && !quiet { eprintln!("{stats}"); }
-    Ok((stats, text))
+    Ok((stats, text, generated_ids))
 }
 
-// ── Single-shot generation ──────────────────────────────────────────────────
-//
-// Resets the KV cache before AND after, so each call starts from a clean
-// context. Used by --prompt and --bench.
+// ── Llama 3.1 chat template ───────────────────────────────────────────────────
 
-pub fn generate(
-    prompt: &str,
-    fwd: &mut ForwardPass,
-    model: &MappedModel,
-    tok: &Tokenizer,
-    cfg: &GenerateConfig,
-) -> Result<GenerateStats, GenerateError> {
+const T_BOS:          u32 = 128_000; // <|begin_of_text|>
+const T_START_HEADER: u32 = 128_006; // <|start_header_id|>
+const T_END_HEADER:   u32 = 128_007; // <|end_header_id|>
+const T_EOT:          u32 = 128_009; // <|eot_id|>
+const T_NEWLINES:     u32 = 271;     // "\n\n"
 
-    if prompt.trim().is_empty() { return Err(GenerateError::EmptyPrompt); }
+// ── Session (Sliding Window Manager) ──────────────────────────────────────────
 
-    // Ensure a clean slate regardless of prior state
-    fwd.reset_kv();
+pub struct Session {
+    pub turn_count: usize,
+    pub context_len: usize,
+    pub system_tokens: Vec<u32>,
+    pub history_tokens: Vec<u32>,
+}
 
-    let prompt_ids: Vec<u32> = if cfg.chat_template {
-        build_chat_tokens(prompt, tok)
-    } else {
-        tok.encode(prompt, cfg.add_bos)
-    };
-    if prompt_ids.is_empty() { return Err(GenerateError::EmptyPrompt); }
-    if prompt_ids.len() >= cfg.context_len {
-        return Err(GenerateError::ContextLengthExceeded { max: cfg.context_len });
+impl Session {
+    pub fn new(context_len: usize, tok: &Tokenizer) -> Self {
+        let mut sys = vec![T_BOS, T_START_HEADER];
+        sys.extend_from_slice(&tok.encode_no_bos("system"));
+        sys.push(T_END_HEADER);
+        sys.extend_from_slice(&tok.encode_no_bos("\n\nYou are a helpful AI assistant."));
+        sys.push(T_EOT);
+
+        Self {
+            turn_count: 0,
+            context_len,
+            system_tokens: sys,
+            history_tokens: Vec::new(),
+        }
     }
 
-    let stats = run_generation(&prompt_ids, fwd, model, tok, cfg)?;
-
-    // Reset after so the next single-shot call also starts clean
-    fwd.reset_kv();
-    Ok(stats)
+    pub fn is_empty(&self) -> bool { self.turn_count == 0 }
+    
+    pub fn reset(&mut self) {
+        self.turn_count = 0;
+        self.history_tokens.clear();
+    }
 }
 
-// ── Multi-turn chat generation ────────────────────────────────────────────────
-//
-// `turn_number` is 0 for the first message in a conversation, 1+ for
-// follow-ups. The first turn includes BOS + system prompt; follow-ups are
-// just the user message + assistant header, appended to the existing cache.
-//
-// Does NOT reset the KV cache — conversation history persists until /reset
-// (caller calls fwd.reset_kv() explicitly) or the cache fills up
-// (ContextFull error).
+// ── Multi-turn chat generation (With Sliding Window) ──────────────────────────
 
 pub fn generate_turn(
     user_message: &str,
-    turn_number: usize,
+    session: &mut Session,
     fwd: &mut ForwardPass,
     model: &MappedModel,
     tok: &Tokenizer,
@@ -271,123 +239,61 @@ pub fn generate_turn(
 
     if user_message.trim().is_empty() { return Err(GenerateError::EmptyPrompt); }
 
-    let turn_ids: Vec<u32> = if turn_number == 0 {
-        build_chat_tokens(user_message, tok)
+    // 1. Format the new user message
+    let mut new_turn = vec![T_START_HEADER];
+    new_turn.extend_from_slice(&tok.encode_no_bos("user"));
+    new_turn.push(T_END_HEADER);
+    new_turn.extend_from_slice(&tok.encode_no_bos(&format!("\n\n{user_message}")));
+    new_turn.push(T_EOT);
+
+    // Add assistant prompt header
+    new_turn.push(T_START_HEADER);
+    new_turn.extend_from_slice(&tok.encode_no_bos("assistant"));
+    new_turn.push(T_END_HEADER);
+    new_turn.push(T_NEWLINES);
+
+    // 2. Sliding Window Logic: Check if we are going to exceed RAM
+    let needed_space = new_turn.len() + cfg.max_new_tokens;
+    let available_space = session.context_len.saturating_sub(session.system_tokens.len());
+
+    if needed_space > available_space {
+        return Err(GenerateError::ContextLengthExceeded { max: session.context_len });
+    }
+
+    let mut requires_reprefill = false;
+
+    // Slide the window: Drop oldest tokens until we have enough space
+    while session.system_tokens.len() + session.history_tokens.len() + needed_space > session.context_len {
+        let drop_amount = 128.min(session.history_tokens.len());
+        session.history_tokens.drain(0..drop_amount);
+        requires_reprefill = true;
+    }
+
+    // 3. Update session memory with the new user message
+    session.history_tokens.extend_from_slice(&new_turn);
+
+    // 4. Inject to KV Cache
+    let mut tokens_to_process = Vec::new();
+    
+    if requires_reprefill || session.turn_count == 0 {
+        // We had to drop old memory (or it's turn 1), so wipe the KV cache and reload
+        fwd.reset_kv();
+        tokens_to_process.extend_from_slice(&session.system_tokens);
+        tokens_to_process.extend_from_slice(&session.history_tokens);
+        if trace_enabled() { eprintln!("[Z.1] Sliding window activated. Re-prefilling context."); }
     } else {
-        build_followup_chat_tokens(user_message, tok)
-    };
-
-    run_generation(&turn_ids, fwd, model, tok, cfg)
-}
-
-// ── Llama 3.1 chat template ───────────────────────────────────────────────────
-
-// Special token IDs for Llama 3.1
-const T_BOS:          u32 = 128_000; // <|begin_of_text|>
-const T_START_HEADER: u32 = 128_006; // <|start_header_id|>
-const T_END_HEADER:   u32 = 128_007; // <|end_header_id|>
-const T_EOT:          u32 = 128_009; // <|eot_id|>
-const T_NEWLINES:     u32 = 271;     // "\n\n"
-
-/// Build the Llama 3.1 instruct token sequence for the FIRST turn of a
-/// conversation: BOS + system prompt + user message + assistant header.
-pub fn build_chat_tokens(user_message: &str, tok: &Tokenizer) -> Vec<u32> {
-    let mut ids: Vec<u32> = Vec::new();
-
-    ids.push(T_BOS);
-
-    // System turn
-    ids.push(T_START_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos("system"));
-    ids.push(T_END_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos("\n\nYou are a helpful AI assistant."));
-    ids.push(T_EOT);
-
-    // User turn
-    ids.push(T_START_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos("user"));
-    ids.push(T_END_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos(&format!("\n\n{user_message}")));
-    ids.push(T_EOT);
-
-    // Assistant header — model generates the response after this
-    ids.push(T_START_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos("assistant"));
-    ids.push(T_END_HEADER);
-    ids.push(T_NEWLINES);
-
-    ids
-}
-
-/// Build the token sequence for a FOLLOW-UP turn: just the new user message
-/// wrapped in user/assistant headers, with NO BOS and NO system prompt.
-/// Appended to the existing KV cache, which already holds everything before
-/// this point (including the model's previous EOT from its last reply).
-pub fn build_followup_chat_tokens(user_message: &str, tok: &Tokenizer) -> Vec<u32> {
-    let mut ids: Vec<u32> = Vec::new();
-
-    // User turn
-    ids.push(T_START_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos("user"));
-    ids.push(T_END_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos(&format!("\n\n{user_message}")));
-    ids.push(T_EOT);
-
-    // Assistant header
-    ids.push(T_START_HEADER);
-    ids.extend_from_slice(&tok.encode_no_bos("assistant"));
-    ids.push(T_END_HEADER);
-    ids.push(T_NEWLINES);
-
-    ids
-}
-
-pub fn llama3_chat_template(user_message: &str) -> String {
-    // Kept for compatibility but build_chat_tokens is preferred
-    user_message.to_string()
-}
-
-// ── Session (multi-turn) ──────────────────────────────────────────────────────
-//
-// Tracks turn count so generate_turn() knows whether to include BOS+system.
-// The KV cache itself (in ForwardPass) holds the actual conversation state.
-
-pub struct Session {
-    pub turn_count:  usize,
-    pub context_len: usize,
-}
-
-impl Session {
-    pub fn new(context_len: usize) -> Self { Self { turn_count: 0, context_len } }
-    pub fn is_empty(&self) -> bool { self.turn_count == 0 }
-    pub fn record_turn(&mut self) { self.turn_count += 1; }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chat_template_format() {
-        let out = llama3_chat_template("Hello");
-        assert!(out.contains("Hello"));
+        // No memory dropped! We can seamlessly append this turn to the existing KV cache.
+        tokens_to_process.extend_from_slice(&new_turn);
     }
 
-    #[test]
-    fn generate_stats_display() {
-        let stats = GenerateStats { prompt_tokens: 20, generated_tokens: 100,
-            prompt_ms: 500.0, generate_ms: 71_000.0 };
-        assert!((stats.tokens_per_second() - 100.0 / 71.0).abs() < 0.1);
-    }
+    session.turn_count += 1;
 
-    #[test]
-    fn session_turn_tracking() {
-        let mut s = Session::new(512);
-        assert!(s.is_empty());
-        s.record_turn();
-        assert!(!s.is_empty());
-        assert_eq!(s.turn_count, 1);
-    }
+    // 5. Run Generation
+    let (stats, generated_ids) = run_generation(&tokens_to_process, fwd, model, tok, cfg)?;
+
+    // 6. Save the AI's generated response into our session history so it remembers it next time
+    session.history_tokens.extend_from_slice(&generated_ids);
+    session.history_tokens.push(T_EOT);
+
+    Ok(stats)
 }

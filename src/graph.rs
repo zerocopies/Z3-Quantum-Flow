@@ -53,6 +53,7 @@ impl std::error::Error for ForwardError {}
 
 // ── Tensor dims (b3534 layout: ne[4] at byte offset 16) ──────────────────────
 
+#[allow(dead_code)]
 unsafe fn tensor_dims(t: *const ffi::ggml_tensor) -> [i64; 4] {
     let p = (t as *const u8).add(16) as *const i64;
     [*p, *p.add(1), *p.add(2), *p.add(3)]

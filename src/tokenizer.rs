@@ -54,7 +54,7 @@ impl std::error::Error for TokenizerError {}
 #[derive(Debug, Clone)]
 struct VocabEntry {
     text: Vec<u8>,   // raw bytes (may not be valid UTF-8 for byte tokens)
-    score: f32,
+    _score: f32,
     token_type: u32, // 1=normal, 2=unknown, 3=control, 6=byte
 }
 
@@ -107,7 +107,7 @@ impl Tokenizer {
             };
 
             token_to_id.insert(text.clone(), i as u32);
-            vocab.push(VocabEntry { text, score, token_type });
+            vocab.push(VocabEntry { text, _score: score, token_type });
         }
 
         // Build merge rank table

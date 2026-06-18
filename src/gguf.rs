@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek};
 use std::path::Path;
 
 // ── Magic & version ───────────────────────────────────────────────────────────

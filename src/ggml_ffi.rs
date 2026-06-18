@@ -1,8 +1,8 @@
+#![allow(non_camel_case_types, dead_code)]
+
 // Z.1 — ggml_ffi.rs
 // Single source of truth for all ggml opaque types and FFI declarations.
 // Both loader.rs and graph.rs import from here.
-
-#[allow(non_camel_case_types, dead_code)]
 
 use std::ffi::c_void;
 use libc::c_int;
