@@ -52,7 +52,7 @@ pub struct GenerateConfig {
 impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
-            max_new_tokens: 512,
+            max_new_tokens: 256, 
             sampling: SamplingConfig::default(),
             context_len: 512,
             print_timing: true,
@@ -207,7 +207,8 @@ impl Session {
         let mut sys = vec![T_BOS, T_START_HEADER];
         sys.extend_from_slice(&tok.encode_no_bos("system"));
         sys.push(T_END_HEADER);
-        sys.extend_from_slice(&tok.encode_no_bos("\n\nYou are a helpful AI assistant."));
+        sys.push(T_NEWLINES); // FIX: Manually push the newline token boundary
+        sys.extend_from_slice(&tok.encode_no_bos("You are a highly capable AI assistant."));
         sys.push(T_EOT);
 
         Self {
@@ -243,7 +244,8 @@ pub fn generate_turn(
     let mut new_turn = vec![T_START_HEADER];
     new_turn.extend_from_slice(&tok.encode_no_bos("user"));
     new_turn.push(T_END_HEADER);
-    new_turn.extend_from_slice(&tok.encode_no_bos(&format!("\n\n{user_message}")));
+    new_turn.push(T_NEWLINES); // FIX: Manually push the newline token boundary
+    new_turn.extend_from_slice(&tok.encode_no_bos(user_message));
     new_turn.push(T_EOT);
 
     // Add assistant prompt header
