@@ -2,3 +2,7 @@
 vendor/
 *.db
 /target
+*.gguf
+ai_playground/llamafile
+*.bak*
+*.png

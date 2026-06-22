@@ -4,3 +4,7 @@ members = [
     "ZeroCopies/src-tauri",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+# This maps 'z1' (your import alias) to 'z3-quantum-flow' (the package name)
+z1 = { path = "z1-core", package = "z3-quantum-flow" }

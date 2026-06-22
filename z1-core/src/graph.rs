@@ -30,7 +30,7 @@ use crate::loader::MappedModel;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const DEFAULT_N_CTX: i64   = 512;
+
 const MAX_CTX: i64         = 4096;
 const GRAPH_MEM_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
@@ -229,8 +229,8 @@ unsafe impl Send for ForwardPass {}
 impl ForwardPass {
     /// Matches main.rs: ForwardPass::new(&model)
     /// Uses DEFAULT_N_CTX (512) — matches existing GenerateConfig::default()
-    pub fn new(model: &MappedModel) -> Result<Self> {
-        let n_ctx   = DEFAULT_N_CTX;
+    pub fn new(model: &MappedModel, n_ctx: i64) -> Result<Self> {
+        // n_ctx is now passed by caller - removed DEFAULT_N_CTX hardcode
         let dna     = ModelDNA::from_model(model)?;
         let backend = unsafe { ffi::ggml_backend_cpu_init() };
         if backend.is_null() { anyhow::bail!("CPU backend init failed"); }
