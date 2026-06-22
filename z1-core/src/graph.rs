@@ -1,794 +1,596 @@
-/// Z.1 — graph.rs  [Graph-reuse edition]
+/// Z.3 — graph.rs [QUANTUM-FLOW ENGINE v3.2 — ForwardPass Compatible]
 ///
-/// Two execution paths:
-///   prefill()    — full prompt; local graph rebuilt each call (once per generation)
-///   decode_one() — single token; persistent pre-built graph, reused every step
+/// Public API matches the existing generate.rs / main.rs interface exactly:
+///   ForwardPass::new(&model)
+///   fwd.prefill(token_ids, model)  -> Result<Vec<f32>, ForwardError>
+///   fwd.decode_one(token_id, model) -> Result<Vec<f32>, ForwardError>
+///   fwd.reset_kv()
+///   fwd.kv.n_ctx  (pub field)
+///   fwd.kv.head   (pub field)
 ///
-/// KV cache tensors are allocated in a proper backend buffer so both
-/// ggml_cpy (prefill) and ggml_backend_tensor_set (decode) can write to them.
+/// Internal fixes over v3.2:
+///   1. Metadata keys have dot separator ("{}.vocab_size" not "{}vocab_size")
+///   2. Overflow checked before advance — no corrupted KV state
+///   3. ggml_init null-checked in QuantumKV::new and build_graph
+///   4. cleanup_graph_resources() — single teardown, correct order
+///   5. Graph freed with ctx (not separately) — no double-free
+///   6. galloc freed before ctx
+///   7. rebuild_count for performance profiling
+///
+/// prefill() note: currently sequential decode_one per token (correct, not batched).
+/// A proper batched prefill is a future optimisation.
 
 use std::ffi::c_void;
-use std::sync::OnceLock;
-
-/// Returns true if Z1_TRACE=1 is set in the environment. Cached after first call.
-/// Gates the [Z.1 DIAG] per-token diagnostic prints — useful during debugging,
-/// noisy for normal runs and benchmarks.
-fn trace_enabled() -> bool {
-    static TRACE: OnceLock<bool> = OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var("Z1_TRACE").map(|v| v == "1").unwrap_or(false))
-}
-use std::fmt;
+use std::ptr::null_mut;
+use anyhow::Result;
 use libc::c_int;
-
-use anyhow::{bail, Result};
 
 use crate::ggml_ffi::{self as ffi, GgmlInitParams};
 use crate::loader::MappedModel;
 
-// ── Error types ───────────────────────────────────────────────────────────────
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+const DEFAULT_N_CTX: i64   = 512;
+const MAX_CTX: i64         = 4096;
+const GRAPH_MEM_SIZE: usize = 512 * 1024 * 1024; // 512 MB
+
+// ── ForwardError (matches generate.rs import) ─────────────────────────────────
 
 #[derive(Debug)]
 pub enum ForwardError {
-    ShapeMismatch { expected: usize, got: usize },
+    Init(String),
     MissingTensor(String),
     ComputeFailed(i32),
-    AllocationFailed(String),
+    ContextFull,
+    Internal(String),
 }
 
-impl fmt::Display for ForwardError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ShapeMismatch { expected, got } =>
-                write!(f, "shape mismatch: expected {expected}, got {got}"),
-            Self::MissingTensor(name) =>
-                write!(f, "missing tensor: {name}"),
-            Self::ComputeFailed(status) =>
-                write!(f, "compute failed with status {status}"),
-            Self::AllocationFailed(msg) =>
-                write!(f, "allocation failed: {msg}"),
+            Self::Init(msg)           => write!(f, "[Z.3 INIT] {}", msg),
+            Self::MissingTensor(name) => write!(f, "[Z.3 MISSING] tensor: {}", name),
+            Self::ComputeFailed(code) => write!(f, "[Z.3 COMPUTE] failed with status {}", code),
+            Self::ContextFull         => write!(f, "[Z.3 OVERFLOW] context window full"),
+            Self::Internal(msg)       => write!(f, "[Z.3 INTERNAL] {}", msg),
         }
     }
 }
 impl std::error::Error for ForwardError {}
 
-// ── Tensor dims (b3534 layout: ne[4] at byte offset 16) ──────────────────────
-
-#[allow(dead_code)]
-unsafe fn tensor_dims(t: *const ffi::ggml_tensor) -> [i64; 4] {
-    let p = (t as *const u8).add(16) as *const i64;
-    [*p, *p.add(1), *p.add(2), *p.add(3)]
+// Bridge anyhow → ForwardError for internal calls
+impl From<anyhow::Error> for ForwardError {
+    fn from(e: anyhow::Error) -> Self { Self::Internal(e.to_string()) }
 }
 
-// ── Hyperparameters ───────────────────────────────────────────────────────────
+// ── Model DNA ─────────────────────────────────────────────────────────────────
 
-pub struct LlamaHparams {
-    pub n_vocab:      i64,
-    pub n_embd:       i64,
-    pub n_head:       i64,
-    pub n_head_kv:    i64,
-    pub n_layer:      i64,
-    pub n_ff:         i64,
-    pub n_rot:        i64,
-    pub freq_base:    f32,
-    pub rms_norm_eps: f32,
+#[derive(Clone, Debug)]
+pub struct ModelDNA {
+    pub n_vocab:          i64,
+    pub n_embd:           i64,
+    pub n_head:           i64,
+    pub n_head_kv:        i64,
+    pub n_layer:          i64,
+    pub n_ff:             i64,
+    pub n_rot:            i64,
+    pub freq_base:        f32,
+    pub rms_eps:          f32,
+    pub has_tied_weights: bool,
 }
 
-impl LlamaHparams {
-    pub fn from_model(model: &MappedModel) -> Self {
+impl ModelDNA {
+    pub fn from_model(model: &MappedModel) -> Result<Self> {
         let arch = model.header.architecture().unwrap_or("llama");
         let meta = &model.header.metadata;
+
         let get_u32 = |key: &str| -> i64 {
             meta.get(key).and_then(|v| v.as_u32()).unwrap_or(0) as i64
         };
-        let get_f32 = |key: &str, default: f32| -> f32 {
+        let get_f32 = |key: &str, def: f32| -> f32 {
             meta.get(key)
                 .and_then(|v| if let crate::gguf::GgufValue::F32(f) = v { Some(*f) } else { None })
-                .unwrap_or(default)
+                .unwrap_or(def)
         };
-        LlamaHparams {
-            n_vocab:      get_u32("llama.vocab_size"),
-            n_embd:       get_u32(&format!("{}.embedding_length", arch)),
-            n_head:       get_u32(&format!("{}.attention.head_count", arch)),
-            n_head_kv:    get_u32(&format!("{}.attention.head_count_kv", arch)),
-            n_layer:      get_u32(&format!("{}.block_count", arch)),
-            n_ff:         get_u32(&format!("{}.feed_forward_length", arch)),
-            n_rot:        get_u32(&format!("{}.rope.dimension_count", arch)),
-            freq_base:    get_f32(&format!("{}.rope.freq_base", arch), 500000.0),
-            rms_norm_eps: get_f32(&format!("{}.attention.layer_norm_rms_epsilon", arch), 1e-5),
-        }
+
+        let has_tied = model.tensor("output.weight").is_none()
+            && model.tensor("token_embd.weight").is_some();
+
+        Ok(ModelDNA {
+            n_vocab:          get_u32(&format!("{}.vocab_size", arch)),
+            n_embd:           get_u32(&format!("{}.embedding_length", arch)),
+            n_head:           get_u32(&format!("{}.attention.head_count", arch)),
+            n_head_kv:        get_u32(&format!("{}.attention.head_count_kv", arch)),
+            n_layer:          get_u32(&format!("{}.block_count", arch)),
+            n_ff:             get_u32(&format!("{}.feed_forward_length", arch)),
+            n_rot:            get_u32(&format!("{}.rope.dimension_count", arch)),
+            freq_base:        get_f32(&format!("{}.rope.freq_base", arch), 10000.0),
+            rms_eps:          get_f32(&format!("{}.attention.layer_norm_rms_epsilon", arch), 1e-6),
+            has_tied_weights: has_tied || arch == "qwen2",
+        })
     }
-    pub fn head_dim(&self) -> i64 { self.n_embd / self.n_head }
+
+    pub fn head_dim(&self) -> i64 {
+        if self.n_head == 0 { 1 } else { self.n_embd / self.n_head }
+    }
 }
 
-// ── KV cache ──────────────────────────────────────────────────────────────────
-//
-// Tensors are allocated in a proper backend buffer (not ggml's internal pool).
-// This is required so that both ggml_cpy (prefill, inside graph) and
-// ggml_backend_tensor_set (decode, outside graph) can write to them.
+// ── Quantum KV Cache ──────────────────────────────────────────────────────────
+///
+/// Fields are pub so generate.rs can read fwd.kv.n_ctx and fwd.kv.head directly.
 
-pub struct KVCache {
-    pub ctx:      *mut ffi::ggml_context,         // tensor descriptors
-    pub data_buf: ffi::ggml_backend_buffer_t,     // actual data storage
-    pub k:        Vec<*mut ffi::ggml_tensor>,
-    pub v:        Vec<*mut ffi::ggml_tensor>,
+pub struct QuantumKV {
+    ctx:          *mut ffi::ggml_context,
+    buf:          ffi::ggml_backend_buffer_t,
+    pub k_ptrs:   Vec<*mut ffi::ggml_tensor>,
+    pub v_ptrs:   Vec<*mut ffi::ggml_tensor>,
     pub n_ctx:    i64,
-    pub head:     i64,
+    pub head:     i64,   // current write position; matches generate.rs fwd.kv.head
+    pub stride:   usize, // bytes per row (one position)
 }
-unsafe impl Send for KVCache {}
 
-impl KVCache {
-    /// n_layers  — number of transformer layers
-    /// n_head_kv — number of KV heads (e.g. 8 for GQA)
-    /// head_dim  — dimension per head (e.g. 128)
-    /// n_ctx     — maximum context length
-    /// backend   — must be the same backend used by the inference graph
+impl QuantumKV {
     pub fn new(
-        n_layers:  usize,
-        n_head_kv: i64,
-        head_dim:  i64,
-        n_ctx:     i64,
-        backend:   ffi::ggml_backend_t,
-    ) -> Self {
-        let bytes_per  = (n_head_kv * head_dim * n_ctx * 4) as usize; // F32
-        let total_data = bytes_per * n_layers * 2 + 1024;
+        n_layers: usize,
+        h_k:      i64,
+        h_d:      i64,
+        n_ctx:    i64,
+        backend:  ffi::ggml_backend_t,
+    ) -> Result<Self> {
+        let elem  = (h_k * h_d * n_ctx) as usize;
+        let bytes = elem * 4; // f32
+        let total = bytes * n_layers * 2;
 
-        // Allocate data in a backend-registered buffer so buffer pointer is non-NULL
-        let data_buf = unsafe { ffi::ggml_backend_alloc_buffer(backend, total_data) };
-        let buf_base = unsafe { ffi::ggml_backend_buffer_get_base(data_buf) } as usize;
+        log::info!("[Z.3] Allocating {:.2} MB Quantum-KV (layers={}, n_ctx={})",
+            total as f32 / (1024.0 * 1024.0), n_layers, n_ctx);
 
-        // Small context for tensor descriptors only (no data in this context)
+        let buf = unsafe { ffi::ggml_backend_alloc_buffer(backend, total) };
+        if buf.is_null() {
+            anyhow::bail!("KV buffer allocation failed");
+        }
+
+        let base = unsafe { ffi::ggml_backend_buffer_get_base(buf) } as usize;
+
         let ctx = unsafe {
             ffi::ggml_init(GgmlInitParams {
-                mem_size:   (n_layers * 2 + 16) * 512,
-                mem_buffer: std::ptr::null_mut(),
+                mem_size:   (n_layers * 4 + 64) * 512,
+                mem_buffer: null_mut(),
                 no_alloc:   true,
             })
         };
+        if ctx.is_null() { anyhow::bail!("KV ggml_init failed"); }
 
-        let mut k = Vec::with_capacity(n_layers);
-        let mut v = Vec::with_capacity(n_layers);
+        let mut k_ptrs = Vec::with_capacity(n_layers);
+        let mut v_ptrs = Vec::with_capacity(n_layers);
+        let stride = (h_k * h_d * 4) as usize;
 
         for i in 0..n_layers {
             unsafe {
-                let kt = ffi::ggml_new_tensor_2d(ctx, 0, n_head_kv * head_dim, n_ctx);
-                ffi::ggml_backend_tensor_alloc(
-                    data_buf, kt,
-                    (buf_base + i * bytes_per) as *mut c_void,
-                );
-                k.push(kt);
+                let kt = ffi::ggml_new_tensor_2d(ctx, 0, h_k * h_d, n_ctx);
+                ffi::ggml_backend_tensor_alloc(buf, kt, (base + i * bytes) as *mut c_void);
+                k_ptrs.push(kt);
 
-                let vt = ffi::ggml_new_tensor_2d(ctx, 0, n_head_kv * head_dim, n_ctx);
-                ffi::ggml_backend_tensor_alloc(
-                    data_buf, vt,
-                    (buf_base + n_layers * bytes_per + i * bytes_per) as *mut c_void,
-                );
-                v.push(vt);
+                let vt = ffi::ggml_new_tensor_2d(ctx, 0, h_k * h_d, n_ctx);
+                ffi::ggml_backend_tensor_alloc(buf, vt, (base + (n_layers + i) * bytes) as *mut c_void);
+                v_ptrs.push(vt);
             }
         }
 
-        // Zero-initialise so unused positions are benign
-        let zeros = vec![0.0f32; (n_head_kv * head_dim * n_ctx) as usize];
+        // Zero-init the entire cache
+        let zeros = vec![0.0f32; elem];
         for i in 0..n_layers {
             unsafe {
-                ffi::ggml_backend_tensor_set(k[i],
-                    zeros.as_ptr() as *const c_void, 0, bytes_per);
-                ffi::ggml_backend_tensor_set(v[i],
-                    zeros.as_ptr() as *const c_void, 0, bytes_per);
+                ffi::ggml_backend_tensor_set(k_ptrs[i], zeros.as_ptr() as *const c_void, 0, bytes);
+                ffi::ggml_backend_tensor_set(v_ptrs[i], zeros.as_ptr() as *const c_void, 0, bytes);
             }
         }
 
-        KVCache { ctx, data_buf, k, v, n_ctx, head: 0 }
+        Ok(Self { ctx, buf, k_ptrs, v_ptrs, n_ctx, head: 0, stride })
     }
 
     pub fn clear(&mut self) { self.head = 0; }
 }
 
-impl Drop for KVCache {
+impl Drop for QuantumKV {
     fn drop(&mut self) {
         unsafe {
-            ffi::ggml_free(self.ctx);
-            ffi::ggml_backend_buffer_free(self.data_buf);
+            if !self.ctx.is_null() { ffi::ggml_free(self.ctx); }
+            if !self.buf.is_null() { ffi::ggml_backend_buffer_free(self.buf); }
         }
     }
 }
 
-// ── Main graph struct ─────────────────────────────────────────────────────────
+// ── ForwardPass ───────────────────────────────────────────────────────────────
+/// Public name matches generate.rs / main.rs imports.
 
-pub struct LlamaGraph {
-    pub hp:      LlamaHparams,
-    pub backend: ffi::ggml_backend_t,
-    pub kv:      KVCache,
+pub struct ForwardPass {
+    dna:     ModelDNA,
+    backend: ffi::ggml_backend_t,
+    pub kv:  QuantumKV,  // pub so generate.rs can access kv.head and kv.n_ctx
+    n_ctx:   i64,
 
-    // ── Persistent decode graph (built once on first decode_one call) ─────────
-    d_built:   bool,
-    d_inp_ctx: *mut ffi::ggml_context,        // keeps input tensor descriptors alive
-    d_ctx:     *mut ffi::ggml_context,        // compute graph context
-    d_graph:   *mut ffi::ggml_cgraph,
-    d_galloc:  ffi::ggml_gallocr_t,
-    d_inp_buf: ffi::ggml_backend_buffer_t,
-    d_token:   *mut ffi::ggml_tensor,         // [1] i32
-    d_pos:     *mut ffi::ggml_tensor,         // [1] i32
-    d_mask:    *mut ffi::ggml_tensor,         // [n_ctx, 1] f32
-    d_logits:  *mut ffi::ggml_tensor,         // [n_vocab] f32
-    d_k_out:   Vec<*mut ffi::ggml_tensor>,    // per-layer K for cache write
-    d_v_out:   Vec<*mut ffi::ggml_tensor>,    // per-layer V for cache write
+    // Graph resources — all managed via cleanup_graph_resources()
+    ctx:      *mut ffi::ggml_context,
+    inp_ctx:  *mut ffi::ggml_context,
+    graph:    *mut ffi::ggml_cgraph,  // lives inside ctx arena; freed with ctx
+    galloc:   ffi::ggml_gallocr_t,
+    inp_buf:  ffi::ggml_backend_buffer_t,
+
+    d_token:  *mut ffi::ggml_tensor,
+    d_pos:    *mut ffi::ggml_tensor,
+    d_mask:   *mut ffi::ggml_tensor,
+    d_logits: *mut ffi::ggml_tensor,
+
+    pub rebuild_count: u64,
 }
-unsafe impl Send for LlamaGraph {}
 
-impl LlamaGraph {
+unsafe impl Send for ForwardPass {}
+
+impl ForwardPass {
+    /// Matches main.rs: ForwardPass::new(&model)
+    /// Uses DEFAULT_N_CTX (512) — matches existing GenerateConfig::default()
     pub fn new(model: &MappedModel) -> Result<Self> {
-        let hp      = LlamaHparams::from_model(model);
+        let n_ctx   = DEFAULT_N_CTX;
+        let dna     = ModelDNA::from_model(model)?;
         let backend = unsafe { ffi::ggml_backend_cpu_init() };
-        
-        // 1. FIRST check if it initialized successfully
-        if backend.is_null() { bail!("[Z.1 Graph] ggml_backend_cpu_init failed"); }
-        
-        // 2. THEN safely set the threads to 2 to prevent X240 CPU contention
-        unsafe { ffi::ggml_backend_cpu_set_n_threads(backend, 2); }
-        
-        log::info!("[Z.1 Graph] layers={} embd={} heads={}/{} ff={} rot={} freq_base={}",
-            hp.n_layer, hp.n_embd, hp.n_head, hp.n_head_kv, hp.n_ff, hp.n_rot, hp.freq_base
-        );
+        if backend.is_null() { anyhow::bail!("CPU backend init failed"); }
 
-        // 3. Re-added the KV Cache initialization that got deleted!
-        let kv = KVCache::new(
-            hp.n_layer as usize,
-            hp.n_head_kv,
-            hp.head_dim(),
-            512, // Using 512 context size
-            backend
-        );
+        let kv = QuantumKV::new(
+            dna.n_layer as usize,
+            dna.n_head_kv,
+            dna.head_dim(),
+            n_ctx.min(MAX_CTX),
+            backend,
+        )?;
 
-        Ok(LlamaGraph {
-            hp, backend, kv,
-            d_built:   false,
-            d_inp_ctx: std::ptr::null_mut(),
-            d_ctx:     std::ptr::null_mut(),
-            d_graph:   std::ptr::null_mut(),
-            d_galloc:  std::ptr::null_mut(),
-            d_inp_buf: std::ptr::null_mut(),
-            d_token:   std::ptr::null_mut(),
-            d_pos:     std::ptr::null_mut(),
-            d_mask:    std::ptr::null_mut(),
-            d_logits:  std::ptr::null_mut(),
-            d_k_out:   Vec::new(),
-            d_v_out:   Vec::new(),
+        log::info!("[Z.3] Engine ready — layers={} embd={} heads={}/{} vocab={} ctx={}",
+            dna.n_layer, dna.n_embd, dna.n_head, dna.n_head_kv, dna.n_vocab, kv.n_ctx);
+
+        Ok(Self {
+            dna, backend, kv, n_ctx: n_ctx.min(MAX_CTX),
+            ctx:      null_mut(),
+            inp_ctx:  null_mut(),
+            graph:    null_mut(),
+            galloc:   null_mut(),
+            inp_buf:  null_mut(),
+            d_token:  null_mut(),
+            d_pos:    null_mut(),
+            d_mask:   null_mut(),
+            d_logits: null_mut(),
+            rebuild_count: 0,
         })
     }
 
-    // ── Build the persistent single-token decode graph ────────────────────────
-    //
-    // n_tokens=1, kv_len=n_ctx (fixed). d_mask gates which cache positions
-    // are attended to. K/V for the new token are output tensors — written to
-    // the KV cache by Rust after each execution step.
+    // ── Resource teardown ──────────────────────────────────────────────────────
 
-    fn build_decode_graph(&mut self, model: &MappedModel) -> Result<()> {
-        let hp            = &self.hp;
-        let n_ctx         = self.kv.n_ctx;
-        let hd            = hp.head_dim();
-        let n_tokens      = 1i64;
-        let kv_row_stride = (hp.n_head_kv * hd * 4) as usize;
-
-        // Input buffer: token(4B) + gap + pos(4B) + gap + mask(n_ctx×4B)
-        let mask_bytes   = (n_ctx * 4) as usize;
-        let inp_buf_size = 128 + mask_bytes + 256;
-        let inp_buf = unsafe { ffi::ggml_backend_alloc_buffer(self.backend, inp_buf_size) };
-        if inp_buf.is_null() { bail!("[Z.1 Decode] input buffer alloc failed"); }
-        let inp_base = unsafe { ffi::ggml_backend_buffer_get_base(inp_buf) } as usize;
-
-        let inp_ctx = unsafe {
-            ffi::ggml_init(GgmlInitParams {
-                mem_size: 8192, mem_buffer: std::ptr::null_mut(), no_alloc: true,
-            })
-        };
-        if inp_ctx.is_null() {
-            unsafe { ffi::ggml_backend_buffer_free(inp_buf); }
-            bail!("[Z.1 Decode] inp_ctx alloc failed");
-        }
-
-        let d_token = unsafe { ffi::ggml_new_tensor_1d(inp_ctx, 26, n_tokens) };
-        unsafe { ffi::ggml_backend_tensor_alloc(inp_buf, d_token, inp_base as *mut c_void); }
-
-        let d_pos = unsafe { ffi::ggml_new_tensor_1d(inp_ctx, 26, n_tokens) };
-        unsafe { ffi::ggml_backend_tensor_alloc(inp_buf, d_pos, (inp_base + 64) as *mut c_void); }
-
-        // mask [n_ctx, 1] f32 — added to kq inside soft_max_ext
-        let d_mask = unsafe { ffi::ggml_new_tensor_2d(inp_ctx, 0, n_ctx, 1) };
-        unsafe { ffi::ggml_backend_tensor_alloc(inp_buf, d_mask, (inp_base + 128) as *mut c_void); }
-
-        // Initialise mask: all positions invalid
-        let neg_inf = vec![-10000.0f32; n_ctx as usize];
+    fn cleanup_graph_resources(&mut self) {
         unsafe {
-            ffi::ggml_backend_tensor_set(d_mask,
-                neg_inf.as_ptr() as *const c_void, 0, mask_bytes);
+            if !self.galloc.is_null() {
+                ffi::ggml_gallocr_free(self.galloc);
+                self.galloc = null_mut();
+            }
+            // ctx owns the graph — freeing ctx frees graph implicitly
+            if !self.ctx.is_null() {
+                ffi::ggml_free(self.ctx);
+                self.ctx   = null_mut();
+                self.graph = null_mut();
+            }
+            if !self.inp_ctx.is_null() {
+                ffi::ggml_free(self.inp_ctx);
+                self.inp_ctx = null_mut();
+            }
+            if !self.inp_buf.is_null() {
+                ffi::ggml_backend_buffer_free(self.inp_buf);
+                self.inp_buf = null_mut();
+            }
+            self.d_token  = null_mut();
+            self.d_pos    = null_mut();
+            self.d_mask   = null_mut();
+            self.d_logits = null_mut();
         }
+    }
 
-        // Compute graph context — persistent for the session
-        let ctx = unsafe {
+    // ── Graph construction ─────────────────────────────────────────────────────
+    ///
+    /// Rebuilds for every token — view offsets are baked in at build time.
+    /// Copy ops are added to the graph before the logits path, guaranteeing
+    /// write-before-read on the CPU's topological executor.
+
+    fn build_graph(&mut self, model: &MappedModel, current_pos: i64) -> Result<()> {
+        self.rebuild_count += 1;
+        self.cleanup_graph_resources();
+
+        let hp        = &self.dna;
+        let hd        = hp.head_dim();
+        let n_tokens  = 1i64;
+        let kv_stride = self.kv.stride;
+
+        // ── Inputs ─────────────────────────────────────────────────────────────
+
+        let mask_bytes = (self.n_ctx * 4) as usize;
+        let inp_size   = 1024 + mask_bytes + 512;
+
+        self.inp_buf = unsafe { ffi::ggml_backend_alloc_buffer(self.backend, inp_size) };
+        if self.inp_buf.is_null() { anyhow::bail!("input buffer alloc failed"); }
+
+        let inp_base = unsafe { ffi::ggml_backend_buffer_get_base(self.inp_buf) } as usize;
+
+        self.inp_ctx = unsafe {
+            ffi::ggml_init(GgmlInitParams { mem_size: 32768, mem_buffer: null_mut(), no_alloc: true })
+        };
+        if self.inp_ctx.is_null() { anyhow::bail!("inp_ctx ggml_init failed"); }
+
+        self.d_token = unsafe { ffi::ggml_new_tensor_1d(self.inp_ctx, 26, n_tokens) };
+        unsafe { ffi::ggml_backend_tensor_alloc(self.inp_buf, self.d_token, inp_base as *mut c_void) };
+
+        self.d_pos = unsafe { ffi::ggml_new_tensor_1d(self.inp_ctx, 26, n_tokens) };
+        unsafe { ffi::ggml_backend_tensor_alloc(self.inp_buf, self.d_pos, (inp_base + 64) as *mut c_void) };
+
+        self.d_mask = unsafe { ffi::ggml_new_tensor_2d(self.inp_ctx, 0, self.n_ctx, 1) };
+        unsafe { ffi::ggml_backend_tensor_alloc(self.inp_buf, self.d_mask, (inp_base + 128) as *mut c_void) };
+
+        // Positions 0..=current_pos visible, rest masked
+        let mut mask_data = vec![-10000.0f32; self.n_ctx as usize];
+        for i in 0..=current_pos as usize { mask_data[i] = 0.0; }
+        unsafe {
+            ffi::ggml_backend_tensor_set(
+                self.d_mask, mask_data.as_ptr() as *const c_void, 0, mask_bytes,
+            )
+        };
+
+        // ── Compute graph ──────────────────────────────────────────────────────
+
+        self.ctx = unsafe {
             ffi::ggml_init(GgmlInitParams {
-                mem_size: 128 * 1024 * 1024, mem_buffer: std::ptr::null_mut(), no_alloc: true,
+                mem_size:   GRAPH_MEM_SIZE,
+                mem_buffer: null_mut(),
+                no_alloc:   true,
             })
         };
-        if ctx.is_null() {
-            unsafe { ffi::ggml_free(inp_ctx); ffi::ggml_backend_buffer_free(inp_buf); }
-            bail!("[Z.1 Decode] graph ctx alloc failed");
-        }
+        if self.ctx.is_null() { anyhow::bail!("graph ctx ggml_init failed"); }
 
-        let graph = unsafe { ffi::ggml_new_graph_custom(ctx, 16384, false) };
+        self.graph = unsafe { ffi::ggml_new_graph_custom(self.ctx, 65536, false) };
 
         let embd_w = model.tensor("token_embd.weight")
-            .ok_or_else(|| anyhow::anyhow!("token_embd.weight not found"))?;
-        let mut cur = unsafe { ffi::ggml_get_rows(ctx, embd_w, d_token) };
-
-        let mut d_k_out = Vec::with_capacity(hp.n_layer as usize);
-        let mut d_v_out = Vec::with_capacity(hp.n_layer as usize);
+            .ok_or_else(|| anyhow::anyhow!("token_embd.weight missing"))?;
+        let mut cur = unsafe { ffi::ggml_get_rows(self.ctx, embd_w, self.d_token) };
 
         for layer in 0..hp.n_layer as usize {
             let t = |name: &str| -> Result<*mut ffi::ggml_tensor> {
                 model.layer_tensor(layer, name)
-                    .ok_or_else(|| anyhow::anyhow!("blk.{}.{} not found", layer, name))
+                    .ok_or_else(|| anyhow::anyhow!("blk.{}.{} missing", layer, name))
             };
 
-            // Attention norm + QKV projections
-            let normed = unsafe { ffi::ggml_mul(ctx,
-                ffi::ggml_rms_norm(ctx, cur, hp.rms_norm_eps), t("attn_norm.weight")?) };
-            let q = unsafe { ffi::ggml_mul_mat(ctx, t("attn_q.weight")?, normed) };
-            let k = unsafe { ffi::ggml_mul_mat(ctx, t("attn_k.weight")?, normed) };
-            let v = unsafe { ffi::ggml_mul_mat(ctx, t("attn_v.weight")?, normed) };
+            // Pre-attention norm + projections
+            let normed = unsafe {
+                ffi::ggml_mul(self.ctx,
+                    ffi::ggml_rms_norm(self.ctx, cur, hp.rms_eps),
+                    t("attn_norm.weight")?)
+            };
+            let q = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_q.weight")?, normed) };
+            let k = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_k.weight")?, normed) };
+            let v = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_v.weight")?, normed) };
 
-            let q = unsafe { ffi::ggml_reshape_3d(ctx, q, hd, hp.n_head,    n_tokens) };
-            let k = unsafe { ffi::ggml_reshape_3d(ctx, k, hd, hp.n_head_kv, n_tokens) };
-            let v = unsafe { ffi::ggml_reshape_3d(ctx, v, hd, hp.n_head_kv, n_tokens) };
+            let q = unsafe { ffi::ggml_reshape_3d(self.ctx, q, hd, hp.n_head,    n_tokens) };
+            let k = unsafe { ffi::ggml_reshape_3d(self.ctx, k, hd, hp.n_head_kv, n_tokens) };
+            let v = unsafe { ffi::ggml_reshape_3d(self.ctx, v, hd, hp.n_head_kv, n_tokens) };
 
             // RoPE
-            let q = unsafe { ffi::ggml_rope_ext(ctx, q, d_pos, std::ptr::null_mut(),
-                hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0) };
-            let k = unsafe { ffi::ggml_rope_ext(ctx, k, d_pos, std::ptr::null_mut(),
-                hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0) };
+            let q = unsafe {
+                ffi::ggml_rope_ext(self.ctx, q, self.d_pos, null_mut(),
+                    hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+            };
+            let k = unsafe {
+                ffi::ggml_rope_ext(self.ctx, k, self.d_pos, null_mut(),
+                    hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+            };
 
-            // K/V for current token — output tensors written to cache after execution
-            let k_flat = unsafe { ffi::ggml_reshape_2d(ctx,
-                ffi::ggml_cont(ctx, k), hp.n_head_kv * hd, n_tokens) };
-            let v_flat = unsafe { ffi::ggml_reshape_2d(ctx,
-                ffi::ggml_cont(ctx, v), hp.n_head_kv * hd, n_tokens) };
-            unsafe {
-                ffi::ggml_set_output(k_flat);
-                ffi::ggml_set_output(v_flat);
-                ffi::ggml_build_forward_expand(graph, k_flat);
-                ffi::ggml_build_forward_expand(graph, v_flat);
-            }
-            d_k_out.push(k_flat);
-            d_v_out.push(v_flat);
+            // Flatten for cache write
+            let k_flat = unsafe {
+                ffi::ggml_reshape_2d(self.ctx,
+                    ffi::ggml_cont(self.ctx, k), hp.n_head_kv * hd, n_tokens)
+            };
+            let v_flat = unsafe {
+                ffi::ggml_reshape_2d(self.ctx,
+                    ffi::ggml_cont(self.ctx, v), hp.n_head_kv * hd, n_tokens)
+            };
 
-            // Read full KV cache [n_head_kv*hd, n_ctx] — fixed shape every step
-            let k_cache = self.kv.k[layer];
-            let v_cache = self.kv.v[layer];
-            let k_full = unsafe { ffi::ggml_view_2d(ctx, k_cache,
-                hp.n_head_kv * hd, n_ctx, kv_row_stride, 0) };
-            let v_full = unsafe { ffi::ggml_view_2d(ctx, v_cache,
-                hp.n_head_kv * hd, n_ctx, kv_row_stride, 0) };
+            // ── Zero-copy KV write ─────────────────────────────────────────────
+            let k_cache = self.kv.k_ptrs[layer];
+            let v_cache = self.kv.v_ptrs[layer];
 
-            let k_3d = unsafe { ffi::ggml_reshape_3d(ctx,
-                ffi::ggml_cont(ctx, k_full), hd, hp.n_head_kv, n_ctx) };
-            let v_3d = unsafe { ffi::ggml_reshape_3d(ctx,
-                ffi::ggml_cont(ctx, v_full), hd, hp.n_head_kv, n_ctx) };
+            let k_offset = (current_pos as usize) * kv_stride;
+            let v_offset = (current_pos as usize) * kv_stride;
 
-            // Attention — mask applied inside soft_max_ext
+            let k_view = unsafe {
+                ffi::ggml_view_2d(self.ctx, k_cache,
+                    hp.n_head_kv * hd, 1, kv_stride, k_offset)
+            };
+            let v_view = unsafe {
+                ffi::ggml_view_2d(self.ctx, v_cache,
+                    hp.n_head_kv * hd, 1, kv_stride, v_offset)
+            };
+
+            let k_copy = unsafe { ffi::ggml_cpy(self.ctx, k_flat, k_view) };
+            let v_copy = unsafe { ffi::ggml_cpy(self.ctx, v_flat, v_view) };
+
+            // Copy ops first — write-before-read guaranteed on CPU topological executor
+            unsafe { ffi::ggml_build_forward_expand(self.graph, k_copy) };
+            unsafe { ffi::ggml_build_forward_expand(self.graph, v_copy) };
+
+            // ── Attention (reads full cache, including current_pos) ─────────────
+            let k_full = unsafe {
+                ffi::ggml_view_2d(self.ctx, k_cache,
+                    hp.n_head_kv * hd, self.n_ctx, kv_stride, 0)
+            };
+            let v_full = unsafe {
+                ffi::ggml_view_2d(self.ctx, v_cache,
+                    hp.n_head_kv * hd, self.n_ctx, kv_stride, 0)
+            };
+
+            let k_3d = unsafe {
+                ffi::ggml_reshape_3d(self.ctx,
+                    ffi::ggml_cont(self.ctx, k_full), hd, hp.n_head_kv, self.n_ctx)
+            };
+            let v_3d = unsafe {
+                ffi::ggml_reshape_3d(self.ctx,
+                    ffi::ggml_cont(self.ctx, v_full), hd, hp.n_head_kv, self.n_ctx)
+            };
+
             let scale  = 1.0 / (hd as f32).sqrt();
-            let q_perm = unsafe { ffi::ggml_permute(ctx, q, 0, 2, 1, 3) };
-            let k_perm = unsafe { ffi::ggml_cont(ctx,
-                ffi::ggml_permute(ctx, k_3d, 0, 2, 1, 3)) };
-            let v_perm = unsafe { ffi::ggml_cont(ctx,
-                ffi::ggml_permute(ctx, v_3d, 1, 2, 0, 3)) };
+            let q_perm = unsafe { ffi::ggml_permute(self.ctx, q, 0, 2, 1, 3) };
+            let k_perm = unsafe {
+                ffi::ggml_cont(self.ctx, ffi::ggml_permute(self.ctx, k_3d, 0, 2, 1, 3))
+            };
+            let v_perm = unsafe {
+                ffi::ggml_cont(self.ctx, ffi::ggml_permute(self.ctx, v_3d, 1, 2, 0, 3))
+            };
 
-            let kq = unsafe { ffi::ggml_scale(ctx,
-                ffi::ggml_mul_mat(ctx, k_perm, q_perm), scale) };
-            let kq = unsafe { ffi::ggml_soft_max_ext(ctx, kq, d_mask, 1.0, 0.0) };
-            let av = unsafe { ffi::ggml_mul_mat(ctx, v_perm, kq) };
-            let av = unsafe { ffi::ggml_reshape_2d(ctx,
-                ffi::ggml_cont(ctx, ffi::ggml_permute(ctx, av, 0, 2, 1, 3)),
-                hp.n_embd, n_tokens) };
+            let kq = unsafe {
+                ffi::ggml_scale(self.ctx,
+                    ffi::ggml_mul_mat(self.ctx, k_perm, q_perm), scale)
+            };
+            let kq = unsafe { ffi::ggml_soft_max_ext(self.ctx, kq, self.d_mask, 1.0, 0.0) };
+            let av = unsafe { ffi::ggml_mul_mat(self.ctx, v_perm, kq) };
+            let av = unsafe {
+                ffi::ggml_reshape_2d(self.ctx,
+                    ffi::ggml_cont(self.ctx,
+                        ffi::ggml_permute(self.ctx, av, 0, 2, 1, 3)),
+                    hp.n_embd, n_tokens)
+            };
 
-            let attn = unsafe { ffi::ggml_mul_mat(ctx, t("attn_output.weight")?, av) };
-            cur = unsafe { ffi::ggml_add(ctx, cur, attn) };
+            let attn = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_output.weight")?, av) };
+            cur = unsafe { ffi::ggml_add(self.ctx, cur, attn) };
 
-            // FFN SwiGLU
-            let ffn_in = unsafe { ffi::ggml_mul(ctx,
-                ffi::ggml_rms_norm(ctx, cur, hp.rms_norm_eps), t("ffn_norm.weight")?) };
-            let gate = unsafe { ffi::ggml_silu(ctx,
-                ffi::ggml_mul_mat(ctx, t("ffn_gate.weight")?, ffn_in)) };
-            let up   = unsafe { ffi::ggml_mul_mat(ctx, t("ffn_up.weight")?, ffn_in) };
-            let ffn  = unsafe { ffi::ggml_mul_mat(ctx, t("ffn_down.weight")?,
-                ffi::ggml_mul(ctx, gate, up)) };
-            cur = unsafe { ffi::ggml_add(ctx, cur, ffn) };
+            // ── FFN (SwiGLU) ───────────────────────────────────────────────────
+            let ffn_in = unsafe {
+                ffi::ggml_mul(self.ctx,
+                    ffi::ggml_rms_norm(self.ctx, cur, hp.rms_eps),
+                    t("ffn_norm.weight")?)
+            };
+            let gate = unsafe {
+                ffi::ggml_silu(self.ctx,
+                    ffi::ggml_mul_mat(self.ctx, t("ffn_gate.weight")?, ffn_in))
+            };
+            let up  = unsafe { ffi::ggml_mul_mat(self.ctx, t("ffn_up.weight")?,   ffn_in) };
+            let ffn = unsafe {
+                ffi::ggml_mul_mat(self.ctx, t("ffn_down.weight")?,
+                    ffi::ggml_mul(self.ctx, gate, up))
+            };
+            cur = unsafe { ffi::ggml_add(self.ctx, cur, ffn) };
         }
 
-        // Final norm + lm_head
+        // ── Output ─────────────────────────────────────────────────────────────
+
         let out_norm = model.tensor("output_norm.weight")
-            .ok_or_else(|| anyhow::anyhow!("output_norm.weight not found"))?;
-        cur = unsafe { ffi::ggml_mul(ctx,
-            ffi::ggml_rms_norm(ctx, cur, hp.rms_norm_eps), out_norm) };
-        let lm_head = model.tensor("output.weight")
-            .ok_or_else(|| anyhow::anyhow!("output.weight not found"))?;
-        let d_logits = unsafe { ffi::ggml_mul_mat(ctx, lm_head, cur) };
-        unsafe {
-            ffi::ggml_set_output(d_logits);
-            ffi::ggml_build_forward_expand(graph, d_logits);
-        }
+            .ok_or_else(|| anyhow::anyhow!("output_norm.weight missing"))?;
+        cur = unsafe {
+            ffi::ggml_mul(self.ctx,
+                ffi::ggml_rms_norm(self.ctx, cur, hp.rms_eps), out_norm)
+        };
 
-        // Allocate intermediates — one-time cost
-        let buft   = unsafe { ffi::ggml_backend_cpu_buffer_type() };
-        let galloc = unsafe { ffi::ggml_gallocr_new(buft) };
-        if galloc.is_null() {
-            unsafe { ffi::ggml_free(inp_ctx); ffi::ggml_free(ctx); ffi::ggml_backend_buffer_free(inp_buf); }
-            bail!("[Z.1 Decode] gallocr_new failed");
-        }
-        let ok = unsafe { ffi::ggml_gallocr_alloc_graph(galloc, graph) };
-        if !ok {
-            unsafe {
-                ffi::ggml_gallocr_free(galloc);
-                ffi::ggml_free(inp_ctx); ffi::ggml_free(ctx);
-                ffi::ggml_backend_buffer_free(inp_buf);
-            }
-            bail!("[Z.1 Decode] gallocr_alloc_graph failed");
-        }
+        let lm_head = if hp.has_tied_weights {
+            model.tensor("token_embd.weight")
+                .ok_or_else(|| anyhow::anyhow!("token_embd.weight (tied lm_head) missing"))?
+        } else {
+            model.tensor("output.weight")
+                .ok_or_else(|| anyhow::anyhow!("output.weight missing"))?
+        };
 
-        self.d_inp_ctx = inp_ctx;
-        self.d_ctx     = ctx;
-        self.d_graph   = graph;
-        self.d_galloc  = galloc;
-        self.d_inp_buf = inp_buf;
-        self.d_token   = d_token;
-        self.d_pos     = d_pos;
-        self.d_mask    = d_mask;
-        self.d_logits  = d_logits;
-        self.d_k_out   = d_k_out;
-        self.d_v_out   = d_v_out;
-        self.d_built   = true;
+        self.d_logits = unsafe { ffi::ggml_mul_mat(self.ctx, lm_head, cur) };
+        unsafe { ffi::ggml_set_output(self.d_logits) };
+        unsafe { ffi::ggml_build_forward_expand(self.graph, self.d_logits) };
 
-        log::info!("[Z.1 Decode] persistent decode graph built (n_ctx={}, layers={})",
-            n_ctx, hp.n_layer);
+        let buft = unsafe { ffi::ggml_backend_cpu_buffer_type() };
+        self.galloc = unsafe { ffi::ggml_gallocr_new(buft) };
+        let ok = unsafe { ffi::ggml_gallocr_alloc_graph(self.galloc, self.graph) };
+        if !ok { anyhow::bail!("gallocr_alloc_graph failed"); }
+
         Ok(())
     }
 
-    // ── Execute the persistent decode graph for one token ─────────────────────
+    // ── Internal single-token decode ───────────────────────────────────────────
 
-    fn execute_decode(&mut self, token_id: u32, model: &MappedModel) -> Result<Vec<f32>> {
-        if !self.d_built {
-            self.build_decode_graph(model)?;
+    fn decode_internal(&mut self, token_id: u32, model: &MappedModel) -> Result<Vec<f32>> {
+        // Check overflow BEFORE advancing — keeps KV state clean on error
+        let pos = self.kv.head;
+        if pos >= self.n_ctx {
+            anyhow::bail!("context full ({}/{})", pos, self.n_ctx);
         }
+        self.kv.head += 1;
 
-        let hp            = &self.hp;
-        let hd            = hp.head_dim();
-        let n_ctx         = self.kv.n_ctx;
-        let kv_head       = self.kv.head;
-        let kv_row_stride = (hp.n_head_kv * hd * 4) as usize;
+        self.build_graph(model, pos)?;
 
-        if kv_head >= n_ctx {
-            bail!("[Z.1 Decode] KV cache full ({}/{})", kv_head, n_ctx);
-        }
-
-        // Update inputs
         let tok = token_id as i32;
-        unsafe { ffi::ggml_backend_tensor_set(self.d_token,
-            &tok as *const i32 as *const c_void, 0, 4); }
-
-        let pos = kv_head as i32;
-        unsafe { ffi::ggml_backend_tensor_set(self.d_pos,
-            &pos as *const i32 as *const c_void, 0, 4); }
-
-        // Update mask: first kv_head positions valid (0.0), rest masked (-1e4)
-        let mask_bytes = (n_ctx * 4) as usize;
-        let mut mask = vec![-10000.0f32; n_ctx as usize];
-        for i in 0..kv_head as usize { mask[i] = 0.0; }
-        unsafe { ffi::ggml_backend_tensor_set(self.d_mask,
-            mask.as_ptr() as *const c_void, 0, mask_bytes); }
-
-        // Execute — no graph rebuild, no realloc
-        let status = unsafe {
-            ffi::ggml_backend_graph_compute(self.backend, self.d_graph)
-        };
-        if status != 0 { bail!("[Z.1 Decode] compute failed status={}", status); }
-
-        // Write K/V for this token into the cache at position kv_head
-        let kv_elem = (hp.n_head_kv * hd) as usize;
-        let mut buf = vec![0.0f32; kv_elem];
-        for layer in 0..hp.n_layer as usize {
-            unsafe {
-                ffi::ggml_backend_tensor_get(self.d_k_out[layer],
-                    buf.as_mut_ptr() as *mut c_void, 0, kv_row_stride);
-                ffi::ggml_backend_tensor_set(self.kv.k[layer],
-                    buf.as_ptr() as *const c_void,
-                    kv_head as usize * kv_row_stride, kv_row_stride);
-
-                ffi::ggml_backend_tensor_get(self.d_v_out[layer],
-                    buf.as_mut_ptr() as *mut c_void, 0, kv_row_stride);
-                ffi::ggml_backend_tensor_set(self.kv.v[layer],
-                    buf.as_ptr() as *const c_void,
-                    kv_head as usize * kv_row_stride, kv_row_stride);
-            }
+        unsafe {
+            ffi::ggml_backend_tensor_set(
+                self.d_token, &tok as *const i32 as *const c_void, 0, 4);
+            ffi::ggml_backend_tensor_set(
+                self.d_pos, &(pos as i32) as *const i32 as *const c_void, 0, 4);
         }
 
-        self.kv.head = (kv_head + 1).min(n_ctx);
+        let status = unsafe { ffi::ggml_backend_graph_compute(self.backend, self.graph) };
+        if status != 0 { anyhow::bail!("compute failed status={}", status); }
 
-        // Read logits
-        let n_vocab = hp.n_vocab as usize;
+        let n_vocab = self.dna.n_vocab as usize;
         let mut out = vec![0.0f32; n_vocab];
-        unsafe { ffi::ggml_backend_tensor_get(self.d_logits,
-            out.as_mut_ptr() as *mut c_void, 0, n_vocab * 4); }
-
-        // ── DIAGNOSTIC: decode step state + argmax (Z1_TRACE=1) ────────────────
-        if trace_enabled() {
-            let (amax, mval) = out.iter().enumerate()
-                .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
-            // First few elements of mask, to verify it's not all -10000
-            let mut mask_sample = vec![0.0f32; 4];
-            unsafe { ffi::ggml_backend_tensor_get(self.d_mask,
-                mask_sample.as_mut_ptr() as *mut c_void, 0, 16); }
-            eprintln!("[Z.1 DIAG] decode: token_in={} kv_head={} pos={} new_kv_head={} mask[0..4]={:?} argmax={} val={:.3}",
-                tok, kv_head, pos, self.kv.head, mask_sample, amax, mval);
-        }
+        unsafe {
+            ffi::ggml_backend_tensor_get(
+                self.d_logits, out.as_mut_ptr() as *mut c_void, 0, n_vocab * 4)
+        };
 
         Ok(out)
     }
 
-    // ── Prefill: full prompt, local graph (rebuilt each call) ─────────────────
+    // ── Public API ─────────────────────────────────────────────────────────────
 
-    pub fn forward(&mut self, model: &MappedModel, tokens: &[i32], pos: i32)
-        -> Result<Vec<f32>>
-    {
-        let hp        = &self.hp;
-        let n_tokens  = tokens.len() as i64;
-        let tok_bytes = n_tokens as usize * 4;
-
-        let inp_buf = unsafe {
-            ffi::ggml_backend_alloc_buffer(self.backend, tok_bytes * 2 + 256)
-        };
-        if inp_buf.is_null() { bail!("[Z.1 Graph] ggml_backend_alloc_buffer failed"); }
-        let inp_base = unsafe { ffi::ggml_backend_buffer_get_base(inp_buf) } as usize;
-
-        let inp_ctx = unsafe {
-            ffi::ggml_init(GgmlInitParams {
-                mem_size: 4096, mem_buffer: std::ptr::null_mut(), no_alloc: true,
-            })
-        };
-        if inp_ctx.is_null() {
-            unsafe { ffi::ggml_backend_buffer_free(inp_buf); }
-            bail!("[Z.1 Graph] inp_ctx alloc failed");
-        }
-
-        let inp_tokens = unsafe { ffi::ggml_new_tensor_1d(inp_ctx, 26, n_tokens) };
-        unsafe {
-            ffi::ggml_backend_tensor_alloc(inp_buf, inp_tokens, inp_base as *mut c_void);
-            ffi::ggml_backend_tensor_set(inp_tokens,
-                tokens.as_ptr() as *const c_void, 0, tok_bytes);
-        }
-
-        let pos_offset = (tok_bytes + 63) & !63;
-        let positions: Vec<i32> = (pos..pos + n_tokens as i32).collect();
-        let inp_pos = unsafe { ffi::ggml_new_tensor_1d(inp_ctx, 26, n_tokens) };
-        unsafe {
-            ffi::ggml_backend_tensor_alloc(inp_buf, inp_pos,
-                (inp_base + pos_offset) as *mut c_void);
-            ffi::ggml_backend_tensor_set(inp_pos,
-                positions.as_ptr() as *const c_void, 0, tok_bytes);
-        }
-
-        let ctx = unsafe {
-            ffi::ggml_init(GgmlInitParams {
-                mem_size: 64 * 1024 * 1024, mem_buffer: std::ptr::null_mut(), no_alloc: true,
-            })
-        };
-        if ctx.is_null() {
-            unsafe { ffi::ggml_free(inp_ctx); ffi::ggml_backend_buffer_free(inp_buf); }
-            bail!("[Z.1 Graph] graph ctx alloc failed");
-        }
-
-        let graph = unsafe { ffi::ggml_new_graph_custom(ctx, 8192, false) };
-
-        let embd_w = model.tensor("token_embd.weight")
-            .ok_or_else(|| anyhow::anyhow!("token_embd.weight not found"))?;
-        let mut cur = unsafe { ffi::ggml_get_rows(ctx, embd_w, inp_tokens) };
-
-        let hd            = hp.head_dim();
-        let kv_head       = self.kv.head;
-        let kv_len        = kv_head + n_tokens;
-        let kv_row_stride = (hp.n_head_kv * hd * 4) as usize;
-
-        if kv_len > self.kv.n_ctx {
-            unsafe {
-                ffi::ggml_free(ctx); ffi::ggml_free(inp_ctx);
-                ffi::ggml_backend_buffer_free(inp_buf);
-            }
-            bail!("[Z.1 Graph] KV cache overflow: {} > {}", kv_len, self.kv.n_ctx);
-        }
-
-        for layer in 0..hp.n_layer as usize {
-            let t = |name: &str| -> Result<*mut ffi::ggml_tensor> {
-                model.layer_tensor(layer, name)
-                    .ok_or_else(|| anyhow::anyhow!("blk.{}.{} not found", layer, name))
-            };
-
-            let normed = unsafe { ffi::ggml_mul(ctx,
-                ffi::ggml_rms_norm(ctx, cur, hp.rms_norm_eps), t("attn_norm.weight")?) };
-            let q = unsafe { ffi::ggml_mul_mat(ctx, t("attn_q.weight")?, normed) };
-            let k = unsafe { ffi::ggml_mul_mat(ctx, t("attn_k.weight")?, normed) };
-            let v = unsafe { ffi::ggml_mul_mat(ctx, t("attn_v.weight")?, normed) };
-
-            let q = unsafe { ffi::ggml_reshape_3d(ctx, q, hd, hp.n_head,    n_tokens) };
-            let k = unsafe { ffi::ggml_reshape_3d(ctx, k, hd, hp.n_head_kv, n_tokens) };
-            let v = unsafe { ffi::ggml_reshape_3d(ctx, v, hd, hp.n_head_kv, n_tokens) };
-
-            let q = unsafe { ffi::ggml_rope_ext(ctx, q, inp_pos, std::ptr::null_mut(),
-                hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0) };
-            let k = unsafe { ffi::ggml_rope_ext(ctx, k, inp_pos, std::ptr::null_mut(),
-                hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0) };
-
-            // Write K/V into cache via ggml_cpy
-            let k_flat = unsafe { ffi::ggml_reshape_2d(ctx,
-                ffi::ggml_cont(ctx, k), hp.n_head_kv * hd, n_tokens) };
-            let v_flat = unsafe { ffi::ggml_reshape_2d(ctx,
-                ffi::ggml_cont(ctx, v), hp.n_head_kv * hd, n_tokens) };
-
-            let k_write = unsafe { ffi::ggml_view_2d(ctx, self.kv.k[layer],
-                hp.n_head_kv * hd, n_tokens, kv_row_stride,
-                kv_head as usize * kv_row_stride) };
-            let v_write = unsafe { ffi::ggml_view_2d(ctx, self.kv.v[layer],
-                hp.n_head_kv * hd, n_tokens, kv_row_stride,
-                kv_head as usize * kv_row_stride) };
-
-            let k_cpy = unsafe { ffi::ggml_cpy(ctx, k_flat, k_write) };
-            let v_cpy = unsafe { ffi::ggml_cpy(ctx, v_flat, v_write) };
-            unsafe {
-                ffi::ggml_build_forward_expand(graph, k_cpy);
-                ffi::ggml_build_forward_expand(graph, v_cpy);
-            }
-
-            // Read K/V history [0..kv_len]
-            let k_read = unsafe { ffi::ggml_view_2d(ctx, self.kv.k[layer],
-                hp.n_head_kv * hd, kv_len, kv_row_stride, 0) };
-            let v_read = unsafe { ffi::ggml_view_2d(ctx, self.kv.v[layer],
-                hp.n_head_kv * hd, kv_len, kv_row_stride, 0) };
-
-            let k_3d = unsafe { ffi::ggml_reshape_3d(ctx,
-                ffi::ggml_cont(ctx, k_read), hd, hp.n_head_kv, kv_len) };
-            let v_3d = unsafe { ffi::ggml_reshape_3d(ctx,
-                ffi::ggml_cont(ctx, v_read), hd, hp.n_head_kv, kv_len) };
-
-            let scale  = 1.0 / (hd as f32).sqrt();
-            let q_perm = unsafe { ffi::ggml_permute(ctx, q, 0, 2, 1, 3) };
-            let k_perm = unsafe { ffi::ggml_cont(ctx,
-                ffi::ggml_permute(ctx, k_3d, 0, 2, 1, 3)) };
-            let v_perm = unsafe { ffi::ggml_cont(ctx,
-                ffi::ggml_permute(ctx, v_3d, 1, 2, 0, 3)) };
-
-            let kq = unsafe { ffi::ggml_scale(ctx,
-                ffi::ggml_mul_mat(ctx, k_perm, q_perm), scale) };
-            let kq = unsafe { ffi::ggml_soft_max_ext(ctx, kq,
-                std::ptr::null_mut(), 1.0, 0.0) };
-            let av = unsafe { ffi::ggml_mul_mat(ctx, v_perm, kq) };
-            let av = unsafe { ffi::ggml_reshape_2d(ctx,
-                ffi::ggml_cont(ctx, ffi::ggml_permute(ctx, av, 0, 2, 1, 3)),
-                hp.n_embd, n_tokens) };
-
-            let attn = unsafe { ffi::ggml_mul_mat(ctx, t("attn_output.weight")?, av) };
-            cur = unsafe { ffi::ggml_add(ctx, cur, attn) };
-
-            let ffn_in = unsafe { ffi::ggml_mul(ctx,
-                ffi::ggml_rms_norm(ctx, cur, hp.rms_norm_eps), t("ffn_norm.weight")?) };
-            let gate = unsafe { ffi::ggml_silu(ctx,
-                ffi::ggml_mul_mat(ctx, t("ffn_gate.weight")?, ffn_in)) };
-            let up   = unsafe { ffi::ggml_mul_mat(ctx, t("ffn_up.weight")?, ffn_in) };
-            let ffn  = unsafe { ffi::ggml_mul_mat(ctx, t("ffn_down.weight")?,
-                ffi::ggml_mul(ctx, gate, up)) };
-            cur = unsafe { ffi::ggml_add(ctx, cur, ffn) };
-        }
-
-        let out_norm = model.tensor("output_norm.weight")
-            .ok_or_else(|| anyhow::anyhow!("output_norm.weight not found"))?;
-        cur = unsafe { ffi::ggml_mul(ctx,
-            ffi::ggml_rms_norm(ctx, cur, hp.rms_norm_eps), out_norm) };
-
-        let last = unsafe { ffi::ggml_view_1d(ctx, cur, hp.n_embd,
-            ((n_tokens - 1) * hp.n_embd * 4) as usize) };
-        let lm_head = model.tensor("output.weight")
-            .ok_or_else(|| anyhow::anyhow!("output.weight not found"))?;
-        let logits = unsafe { ffi::ggml_mul_mat(ctx, lm_head, last) };
-        unsafe {
-            ffi::ggml_set_output(logits);
-            ffi::ggml_build_forward_expand(graph, logits);
-        }
-
-        let buft   = unsafe { ffi::ggml_backend_cpu_buffer_type() };
-        let galloc = unsafe { ffi::ggml_gallocr_new(buft) };
-        if galloc.is_null() {
-            unsafe { ffi::ggml_free(ctx); ffi::ggml_free(inp_ctx); ffi::ggml_backend_buffer_free(inp_buf); }
-            bail!("[Z.1 Graph] gallocr_new failed");
-        }
-        let ok = unsafe { ffi::ggml_gallocr_alloc_graph(galloc, graph) };
-        if !ok {
-            unsafe {
-                ffi::ggml_gallocr_free(galloc);
-                ffi::ggml_free(ctx); ffi::ggml_free(inp_ctx);
-                ffi::ggml_backend_buffer_free(inp_buf);
-            }
-            bail!("[Z.1 Graph] gallocr_alloc_graph failed");
-        }
-
-        let status = unsafe { ffi::ggml_backend_graph_compute(self.backend, graph) };
-        if status != 0 {
-            unsafe {
-                ffi::ggml_gallocr_free(galloc);
-                ffi::ggml_free(ctx); ffi::ggml_free(inp_ctx);
-                ffi::ggml_backend_buffer_free(inp_buf);
-            }
-            bail!("[Z.1 Graph] compute failed status={}", status);
-        }
-
-        self.kv.head = kv_len.min(self.kv.n_ctx);
-
-        let n_vocab = hp.n_vocab as usize;
-        let mut out = vec![0.0f32; n_vocab];
-        unsafe {
-            ffi::ggml_backend_tensor_get(logits,
-                out.as_mut_ptr() as *mut c_void, 0, n_vocab * 4);
-        }
-
-        // ── DIAGNOSTIC: argmax of prefill output (Z1_TRACE=1) ───────────────────
-        if trace_enabled() {
-            let (amax, mval) = out.iter().enumerate()
-                .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
-            eprintln!("[Z.1 DIAG] prefill done: kv_head_before={} kv_len={} new_kv_head={} argmax={} val={:.3}",
-                kv_head, kv_len, self.kv.head, amax, mval);
-        }
-
-        unsafe {
-            ffi::ggml_gallocr_free(galloc);
-            ffi::ggml_free(ctx);
-            ffi::ggml_free(inp_ctx);
-            ffi::ggml_backend_buffer_free(inp_buf);
-        }
-        Ok(out)
-    }
-
-    pub fn reset_kv(&mut self) { self.kv.clear(); }
-
-    pub fn prefill(&mut self, token_ids: &[u32], model: &MappedModel)
-        -> Result<Vec<f32>, ForwardError>
-    {
+    /// Prefill: process all prompt tokens, return logits for the last one.
+    /// Currently sequential decode_one per token — correct, not yet batched.
+    pub fn prefill(
+        &mut self,
+        token_ids: &[u32],
+        model: &MappedModel,
+    ) -> Result<Vec<f32>, ForwardError> {
         if token_ids.is_empty() {
-            return Err(ForwardError::AllocationFailed("empty token sequence".into()));
+            return Err(ForwardError::Init("empty prefill token list".into()));
         }
-        let tokens: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
-        
-        // FIX: Start positional embeddings at the end of the current memory, not 0!
-        let current_pos = self.kv.head as i32; 
-        
-        self.forward(model, &tokens, current_pos)
-            .map_err(|e| ForwardError::AllocationFailed(e.to_string()))
+        let mut logits = Vec::new();
+        for &tok in token_ids {
+            logits = self.decode_internal(tok, model)?;
+        }
+        Ok(logits)
     }
 
-    pub fn decode_one(&mut self, token_id: u32, model: &MappedModel)
-        -> Result<Vec<f32>, ForwardError>
-    {
-        self.execute_decode(token_id, model)
-            .map_err(|e| ForwardError::AllocationFailed(e.to_string()))
-    }
-}
-
-impl Drop for LlamaGraph {
-    fn drop(&mut self) {
-        if self.d_built {
-            unsafe {
-                ffi::ggml_gallocr_free(self.d_galloc);
-                ffi::ggml_free(self.d_ctx);
-                ffi::ggml_free(self.d_inp_ctx);
-                ffi::ggml_backend_buffer_free(self.d_inp_buf);
+    /// Decode a single token, return logits.
+    pub fn decode_one(
+        &mut self,
+        token_id: u32,
+        model: &MappedModel,
+    ) -> Result<Vec<f32>, ForwardError> {
+        self.decode_internal(token_id, model).map_err(|e| {
+            if e.to_string().contains("context full") {
+                ForwardError::ContextFull
+            } else {
+                ForwardError::Internal(e.to_string())
             }
-        }
-        unsafe { ffi::ggml_backend_free(self.backend); }
-        log::info!("[Z.1 Graph] dropped.");
+        })
     }
+
+    /// Reset KV cache — matches generate.rs fwd.reset_kv()
+    pub fn reset_kv(&mut self) {
+        self.kv.clear();
+        self.cleanup_graph_resources();
+    }
+
+    /// Expose DNA for callers that need model metadata
+    pub fn dna(&self) -> &ModelDNA { &self.dna }
 }
 
-pub type ForwardPass = LlamaGraph;
+impl Drop for ForwardPass {
+    fn drop(&mut self) {
+        self.cleanup_graph_resources();
+        unsafe {
+            if !self.backend.is_null() { ffi::ggml_backend_free(self.backend); }
+        }
+    }
+}
