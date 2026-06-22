@@ -542,10 +542,254 @@ impl ForwardPass {
         Ok(out)
     }
 
+    // ── Batched prefill graph ─────────────────────────────────────────────────
+    /// Builds a single graph that processes all N prompt tokens in one pass.
+    /// Key differences from build_graph (single token):
+    ///   - d_token/d_pos are [n_tokens] not [1]
+    ///   - Causal mask is [n_ctx, n_tokens] — each column has its own visible range
+    ///   - KV view covers N rows at once — one ggml_cpy for all positions
+    ///   - Output logits are [n_vocab, n_tokens] — we extract last token only
+
+    fn build_prefill_graph(
+        &mut self,
+        model: &MappedModel,
+        n_tokens: i64,
+        start_pos: i64,
+    ) -> Result<()> {
+        self.rebuild_count += 1;
+        self.cleanup_graph_resources();
+
+        let hp        = &self.dna;
+        let hd        = hp.head_dim();
+        let kv_stride = self.kv.stride;
+
+        // ── Inputs ─────────────────────────────────────────────────────────────
+
+        // d_token [n_tokens], d_pos [n_tokens], d_mask [n_ctx, n_tokens]
+        let mask_elems = (self.n_ctx * n_tokens) as usize;
+        let mask_bytes = mask_elems * 4;
+        let tok_bytes  = n_tokens as usize * 4;
+        let inp_size   = tok_bytes * 2 + mask_bytes + 1024;
+
+        self.inp_buf = unsafe { ffi::ggml_backend_alloc_buffer(self.backend, inp_size) };
+        if self.inp_buf.is_null() { anyhow::bail!("prefill input buffer alloc failed"); }
+
+        let inp_base = unsafe { ffi::ggml_backend_buffer_get_base(self.inp_buf) } as usize;
+
+        self.inp_ctx = unsafe {
+            ffi::ggml_init(GgmlInitParams { mem_size: 32768, mem_buffer: null_mut(), no_alloc: true })
+        };
+        if self.inp_ctx.is_null() { anyhow::bail!("prefill inp_ctx ggml_init failed"); }
+
+        // token ids: [n_tokens]
+        self.d_token = unsafe { ffi::ggml_new_tensor_1d(self.inp_ctx, 26, n_tokens) };
+        unsafe { ffi::ggml_backend_tensor_alloc(self.inp_buf, self.d_token, inp_base as *mut c_void) };
+
+        // positions: [n_tokens]
+        self.d_pos = unsafe { ffi::ggml_new_tensor_1d(self.inp_ctx, 26, n_tokens) };
+        unsafe { ffi::ggml_backend_tensor_alloc(
+            self.inp_buf, self.d_pos, (inp_base + tok_bytes + 64) as *mut c_void) };
+
+        // causal mask: [n_ctx, n_tokens]
+        // ggml layout: ne[0]=n_ctx, ne[1]=n_tokens
+        // element [ki, qi] is at ki + qi*n_ctx
+        // query at position start_pos+qi can attend to keys 0..=start_pos+qi
+        self.d_mask = unsafe { ffi::ggml_new_tensor_2d(self.inp_ctx, 0, self.n_ctx, n_tokens) };
+        unsafe { ffi::ggml_backend_tensor_alloc(
+            self.inp_buf, self.d_mask, (inp_base + tok_bytes * 2 + 128) as *mut c_void) };
+
+        let mut mask_data = vec![-10000.0f32; mask_elems];
+        for qi in 0..n_tokens as usize {
+            let visible_up_to = (start_pos as usize + qi).min(self.n_ctx as usize - 1);
+            for ki in 0..=visible_up_to {
+                mask_data[ki + qi * self.n_ctx as usize] = 0.0;
+            }
+        }
+        unsafe {
+            ffi::ggml_backend_tensor_set(
+                self.d_mask, mask_data.as_ptr() as *const c_void, 0, mask_bytes)
+        };
+
+        // ── Compute graph ──────────────────────────────────────────────────────
+
+        self.ctx = unsafe {
+            ffi::ggml_init(GgmlInitParams {
+                mem_size:   GRAPH_MEM_SIZE,
+                mem_buffer: null_mut(),
+                no_alloc:   true,
+            })
+        };
+        if self.ctx.is_null() { anyhow::bail!("prefill graph ctx ggml_init failed"); }
+
+        self.graph = unsafe { ffi::ggml_new_graph_custom(self.ctx, 65536, false) };
+
+        // Embedding lookup → [n_embd, n_tokens]
+        let embd_w = model.tensor("token_embd.weight")
+            .ok_or_else(|| anyhow::anyhow!("token_embd.weight missing"))?;
+        let mut cur = unsafe { ffi::ggml_get_rows(self.ctx, embd_w, self.d_token) };
+
+        for layer in 0..hp.n_layer as usize {
+            let t = |name: &str| -> Result<*mut ffi::ggml_tensor> {
+                model.layer_tensor(layer, name)
+                    .ok_or_else(|| anyhow::anyhow!("blk.{}.{} missing", layer, name))
+            };
+
+            // Pre-attention norm + projections → [n_embd, n_tokens]
+            let normed = unsafe {
+                ffi::ggml_mul(self.ctx,
+                    ffi::ggml_rms_norm(self.ctx, cur, hp.rms_eps),
+                    t("attn_norm.weight")?)
+            };
+            let q = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_q.weight")?,  normed) };
+            let k = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_k.weight")?,  normed) };
+            let v = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_v.weight")?,  normed) };
+
+            // Reshape → [hd, n_heads, n_tokens]
+            let q = unsafe { ffi::ggml_reshape_3d(self.ctx, q, hd, hp.n_head,    n_tokens) };
+            let k = unsafe { ffi::ggml_reshape_3d(self.ctx, k, hd, hp.n_head_kv, n_tokens) };
+            let v = unsafe { ffi::ggml_reshape_3d(self.ctx, v, hd, hp.n_head_kv, n_tokens) };
+
+            // RoPE — d_pos [n_tokens] applies per-token positions
+            let q = unsafe {
+                ffi::ggml_rope_ext(self.ctx, q, self.d_pos, null_mut(),
+                    hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+            };
+            let k = unsafe {
+                ffi::ggml_rope_ext(self.ctx, k, self.d_pos, null_mut(),
+                    hp.n_rot as c_int, 0, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+            };
+
+            // Flatten → [n_head_kv * hd, n_tokens]
+            let k_flat = unsafe {
+                ffi::ggml_reshape_2d(self.ctx,
+                    ffi::ggml_cont(self.ctx, k), hp.n_head_kv * hd, n_tokens)
+            };
+            let v_flat = unsafe {
+                ffi::ggml_reshape_2d(self.ctx,
+                    ffi::ggml_cont(self.ctx, v), hp.n_head_kv * hd, n_tokens)
+            };
+
+            // ── KV write: all N rows in one shot ──────────────────────────────
+            let k_cache = self.kv.k_ptrs[layer];
+            let v_cache = self.kv.v_ptrs[layer];
+
+            // View of N rows starting at start_pos
+            let k_view = unsafe {
+                ffi::ggml_view_2d(self.ctx, k_cache,
+                    hp.n_head_kv * hd, n_tokens,
+                    kv_stride,
+                    start_pos as usize * kv_stride)
+            };
+            let v_view = unsafe {
+                ffi::ggml_view_2d(self.ctx, v_cache,
+                    hp.n_head_kv * hd, n_tokens,
+                    kv_stride,
+                    start_pos as usize * kv_stride)
+            };
+
+            let k_copy = unsafe { ffi::ggml_cpy(self.ctx, k_flat, k_view) };
+            let v_copy = unsafe { ffi::ggml_cpy(self.ctx, v_flat, v_view) };
+
+            // Copy ops first — write-before-read on CPU topological executor
+            unsafe { ffi::ggml_build_forward_expand(self.graph, k_copy) };
+            unsafe { ffi::ggml_build_forward_expand(self.graph, v_copy) };
+
+            // ── Attention (reads full cache) ───────────────────────────────────
+            let k_full = unsafe {
+                ffi::ggml_view_2d(self.ctx, k_cache,
+                    hp.n_head_kv * hd, self.n_ctx, kv_stride, 0)
+            };
+            let v_full = unsafe {
+                ffi::ggml_view_2d(self.ctx, v_cache,
+                    hp.n_head_kv * hd, self.n_ctx, kv_stride, 0)
+            };
+
+            let k_3d = unsafe {
+                ffi::ggml_reshape_3d(self.ctx,
+                    ffi::ggml_cont(self.ctx, k_full), hd, hp.n_head_kv, self.n_ctx)
+            };
+            let v_3d = unsafe {
+                ffi::ggml_reshape_3d(self.ctx,
+                    ffi::ggml_cont(self.ctx, v_full), hd, hp.n_head_kv, self.n_ctx)
+            };
+
+            let scale  = 1.0 / (hd as f32).sqrt();
+            let q_perm = unsafe { ffi::ggml_permute(self.ctx, q, 0, 2, 1, 3) };
+            let k_perm = unsafe {
+                ffi::ggml_cont(self.ctx, ffi::ggml_permute(self.ctx, k_3d, 0, 2, 1, 3))
+            };
+            let v_perm = unsafe {
+                ffi::ggml_cont(self.ctx, ffi::ggml_permute(self.ctx, v_3d, 1, 2, 0, 3))
+            };
+
+            // kq: [n_ctx, n_tokens, n_head, 1]
+            let kq = unsafe {
+                ffi::ggml_scale(self.ctx,
+                    ffi::ggml_mul_mat(self.ctx, k_perm, q_perm), scale)
+            };
+            // d_mask [n_ctx, n_tokens] applied across all heads
+            let kq = unsafe { ffi::ggml_soft_max_ext(self.ctx, kq, self.d_mask, 1.0, 0.0) };
+            let av = unsafe { ffi::ggml_mul_mat(self.ctx, v_perm, kq) };
+            let av = unsafe {
+                ffi::ggml_reshape_2d(self.ctx,
+                    ffi::ggml_cont(self.ctx,
+                        ffi::ggml_permute(self.ctx, av, 0, 2, 1, 3)),
+                    hp.n_embd, n_tokens)
+            };
+
+            let attn = unsafe { ffi::ggml_mul_mat(self.ctx, t("attn_output.weight")?, av) };
+            cur = unsafe { ffi::ggml_add(self.ctx, cur, attn) };
+
+            // ── FFN ───────────────────────────────────────────────────────────
+            let ffn_in = unsafe {
+                ffi::ggml_mul(self.ctx,
+                    ffi::ggml_rms_norm(self.ctx, cur, hp.rms_eps),
+                    t("ffn_norm.weight")?)
+            };
+            let gate = unsafe {
+                ffi::ggml_silu(self.ctx,
+                    ffi::ggml_mul_mat(self.ctx, t("ffn_gate.weight")?, ffn_in))
+            };
+            let up  = unsafe { ffi::ggml_mul_mat(self.ctx, t("ffn_up.weight")?,   ffn_in) };
+            let ffn = unsafe {
+                ffi::ggml_mul_mat(self.ctx, t("ffn_down.weight")?,
+                    ffi::ggml_mul(self.ctx, gate, up))
+            };
+            cur = unsafe { ffi::ggml_add(self.ctx, cur, ffn) };
+        }
+
+        // ── Output: [n_vocab, n_tokens] ────────────────────────────────────────
+        let out_norm = model.tensor("output_norm.weight")
+            .ok_or_else(|| anyhow::anyhow!("output_norm.weight missing"))?;
+        cur = unsafe {
+            ffi::ggml_mul(self.ctx,
+                ffi::ggml_rms_norm(self.ctx, cur, hp.rms_eps), out_norm)
+        };
+
+        let lm_head = if hp.has_tied_weights {
+            model.tensor("token_embd.weight")
+                .ok_or_else(|| anyhow::anyhow!("token_embd.weight (tied) missing"))?
+        } else {
+            model.tensor("output.weight")
+                .ok_or_else(|| anyhow::anyhow!("output.weight missing"))?
+        };
+
+        self.d_logits = unsafe { ffi::ggml_mul_mat(self.ctx, lm_head, cur) };
+        unsafe { ffi::ggml_set_output(self.d_logits) };
+        unsafe { ffi::ggml_build_forward_expand(self.graph, self.d_logits) };
+
+        let buft = unsafe { ffi::ggml_backend_cpu_buffer_type() };
+        self.galloc = unsafe { ffi::ggml_gallocr_new(buft) };
+        let ok = unsafe { ffi::ggml_gallocr_alloc_graph(self.galloc, self.graph) };
+        if !ok { anyhow::bail!("prefill gallocr_alloc_graph failed"); }
+
+        Ok(())
+    }
+
     // ── Public API ─────────────────────────────────────────────────────────────
 
-    /// Prefill: process all prompt tokens, return logits for the last one.
-    /// Currently sequential decode_one per token — correct, not yet batched.
+    /// Prefill: process all N prompt tokens in ONE graph pass.
+    /// Builds once, computes once — O(1) graph builds regardless of prompt length.
     pub fn prefill(
         &mut self,
         token_ids: &[u32],
@@ -554,11 +798,69 @@ impl ForwardPass {
         if token_ids.is_empty() {
             return Err(ForwardError::Init("empty prefill token list".into()));
         }
-        let mut logits = Vec::new();
-        for &tok in token_ids {
-            logits = self.decode_internal(tok, model)?;
+
+        let n_tokens  = token_ids.len() as i64;
+        let start_pos = self.kv.head;
+
+        if start_pos + n_tokens > self.n_ctx {
+            return Err(ForwardError::ContextFull);
         }
-        Ok(logits)
+
+        // Build one graph for all N tokens
+        self.build_prefill_graph(model, n_tokens, start_pos)
+            .map_err(|e| ForwardError::Internal(e.to_string()))?;
+
+        // Set token ids: [n_tokens]
+        let tok_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
+        unsafe {
+            ffi::ggml_backend_tensor_set(
+                self.d_token,
+                tok_i32.as_ptr() as *const c_void,
+                0,
+                n_tokens as usize * 4,
+            )
+        };
+
+        // Set positions: [start_pos, start_pos+1, ..., start_pos+n_tokens-1]
+        let pos_i32: Vec<i32> = (start_pos..start_pos + n_tokens)
+            .map(|p| p as i32)
+            .collect();
+        unsafe {
+            ffi::ggml_backend_tensor_set(
+                self.d_pos,
+                pos_i32.as_ptr() as *const c_void,
+                0,
+                n_tokens as usize * 4,
+            )
+        };
+
+        // Execute — one compute pass for all tokens
+        let status = unsafe { ffi::ggml_backend_graph_compute(self.backend, self.graph) };
+        if status != 0 {
+            return Err(ForwardError::ComputeFailed(status));
+        }
+
+        // Advance KV head by N
+        self.kv.head = (start_pos + n_tokens).min(self.n_ctx);
+
+        // Extract last token's logits from [n_vocab, n_tokens]
+        // Last token is at column (n_tokens-1): byte offset = (n_tokens-1) * n_vocab * 4
+        let n_vocab    = self.dna.n_vocab as usize;
+        let last_offset = (n_tokens as usize - 1) * n_vocab * 4;
+        let mut out    = vec![0.0f32; n_vocab];
+        unsafe {
+            ffi::ggml_backend_tensor_get(
+                self.d_logits,
+                out.as_mut_ptr() as *mut c_void,
+                last_offset,
+                n_vocab * 4,
+            )
+        };
+
+        log::info!("[Z.3] Prefill: {} tokens in 1 graph pass (head={})",
+            n_tokens, self.kv.head);
+
+        Ok(out)
     }
 
     /// Decode a single token, return logits.
