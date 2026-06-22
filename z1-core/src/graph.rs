@@ -97,7 +97,7 @@ impl ModelDNA {
             && model.tensor("token_embd.weight").is_some();
 
         Ok(ModelDNA {
-            n_vocab:          get_u32(&format!("{}.vocab_size", arch)),
+            n_vocab: meta.get(&format!("{}.vocab_size", arch)).and_then(|v| v.as_u32()).map(|v| v as i64).unwrap_or_else(|| { if let Some(crate::gguf::GgufValue::Array(arr)) = meta.get("tokenizer.ggml.tokens") { arr.len() as i64 } else { 0 } }),
             n_embd:           get_u32(&format!("{}.embedding_length", arch)),
             n_head:           get_u32(&format!("{}.attention.head_count", arch)),
             n_head_kv:        get_u32(&format!("{}.attention.head_count_kv", arch)),
