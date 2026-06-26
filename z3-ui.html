@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Z3 Quantum-Flow · Local AI Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#16181B;--surface:#202125;--surface-mid:#25262A;--surface-high:#2E2F34;
+  --surface-top:#343439;--on:#E3E2E7;--on-dim:#9A9FAD;--on-faint:#5C6070;
+  --outline:#424751;--blue:#7FB0FF;--blue-dim:#4A7FCC;--lav:#B9ACF6;
+  --pink:#F0A6C9;--yellow:#F2D27E;--navy:#102036;
+  --sidebar:268px;--rail:320px;--r:12px;--r-sm:8px;
+}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);
+  font-family:'Geist','Inter',system-ui,sans-serif}
+.app{display:grid;grid-template-columns:var(--sidebar) 1fr var(--rail);height:100vh}
+
+/* SIDEBAR */
+.sidebar{background:var(--surface);border-right:1px solid var(--outline);display:flex;flex-direction:column;overflow:hidden}
+.brand{display:flex;align-items:center;gap:10px;padding:20px 16px 16px;border-bottom:1px solid var(--outline)}
+.brand-icon{width:36px;height:36px;border-radius:10px;background:var(--blue-dim);display:flex;align-items:center;justify-content:center;font-family:'Geist Mono','Fira Mono',monospace;font-size:11px;color:var(--blue);flex-shrink:0}
+.brand-name{font-size:14px;font-weight:600}
+.brand-sub{font-size:10px;font-family:'Geist Mono',monospace;color:var(--on-dim);text-transform:uppercase;letter-spacing:.5px}
+.new-btn{margin:12px;padding:10px 14px;background:var(--blue);color:var(--navy);border:none;border-radius:var(--r-sm);font-family:inherit;font-size:13.5px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
+.new-btn:hover{background:#9DC4FF}
+.hist{flex:1;overflow-y:auto;padding:8px}
+.hist::-webkit-scrollbar{width:3px}
+.hist::-webkit-scrollbar-thumb{background:var(--outline)}
+.hist-label{font-size:10px;font-family:'Geist Mono',monospace;color:var(--on-faint);text-transform:uppercase;letter-spacing:.8px;padding:12px 8px 6px}
+.hist-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:var(--r-sm);cursor:pointer;font-size:13px;color:var(--on-dim);transition:background .1s;white-space:nowrap;overflow:hidden}
+.hist-item:hover{background:var(--surface-mid);color:var(--on)}
+.hist-item.active{background:var(--surface-high);color:var(--on)}
+.hist-item span{overflow:hidden;text-overflow:ellipsis}
+.sidebar-footer{border-top:1px solid var(--outline);padding:8px}
+.foot-item{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:var(--r-sm);cursor:pointer;font-size:13px;color:var(--on-dim);transition:background .1s}
+.foot-item:hover{background:var(--surface-mid);color:var(--on)}
+
+/* BOOKMARKS PANEL */
+.bookmarks-panel{display:none;flex-direction:column;gap:0;flex:1;overflow-y:auto}
+.bookmarks-panel.open{display:flex}
+.bookmark-entry{padding:10px 12px;border-bottom:1px solid var(--outline);font-size:12px;color:var(--on-dim);line-height:1.5;cursor:pointer}
+.bookmark-entry:hover{background:var(--surface-mid)}
+.bookmark-entry .bk-time{font-family:'Geist Mono',monospace;font-size:10px;color:var(--on-faint);margin-bottom:3px}
+.bookmark-entry .bk-text{color:var(--on);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bookmark-entry .bk-role{font-size:10px;color:var(--blue);margin-bottom:2px}
+
+/* CANVAS */
+.canvas{display:flex;flex-direction:column;background:var(--bg);overflow:hidden}
+.c-header{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:52px;border-bottom:1px solid var(--outline);background:var(--surface);flex-shrink:0}
+.tabs{display:flex;gap:4px}
+.tab{padding:6px 14px;border-radius:6px;font-size:13.5px;cursor:pointer;color:var(--on-dim);border:none;background:none;font-family:inherit;transition:all .15s}
+.tab.active{background:var(--surface-high);color:var(--on);font-weight:600}
+.tab:hover:not(.active){color:var(--on)}
+.h-actions{display:flex;align-items:center;gap:8px}
+.icon-btn{width:34px;height:34px;border-radius:8px;background:none;border:1px solid var(--outline);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--on-dim);transition:all .15s}
+.icon-btn:hover{background:var(--surface-mid);color:var(--on)}
+.icon-btn svg{width:16px;height:16px}
+.deploy-btn{padding:7px 18px;background:var(--blue);color:var(--navy);border:none;border-radius:var(--r-sm);font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+.deploy-btn:hover{background:#9DC4FF}
+
+.hud{margin:10px 24px 0;padding:8px 14px;background:rgba(127,176,255,.07);border:1px solid rgba(127,176,255,.15);border-radius:var(--r-sm);display:flex;align-items:center;gap:8px;font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--blue);letter-spacing:.3px;flex-shrink:0}
+.hud-dot{width:6px;height:6px;border-radius:50%;background:var(--blue);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+.chat-area{flex:1;overflow-y:auto;padding:16px 24px;display:flex;flex-direction:column;gap:16px}
+.chat-area::-webkit-scrollbar{width:4px}
+.chat-area::-webkit-scrollbar-thumb{background:var(--outline);border-radius:2px}
+
+/* Messages */
+.msg-wrap{display:flex;flex-direction:column;gap:4px}
+.msg-wrap.user-wrap{align-items:flex-end}
+.msg-wrap.ai-wrap{align-items:flex-start}
+
+.msg-meta{display:flex;align-items:center;gap:6px;font-family:'Geist Mono',monospace;font-size:10px;color:var(--on-faint)}
+.msg-meta .star-btn{background:none;border:none;cursor:pointer;color:var(--on-faint);padding:0;transition:color .15s;line-height:1}
+.msg-meta .star-btn:hover{color:var(--yellow)}
+.msg-meta .star-btn.starred{color:var(--yellow)}
+.msg-meta .star-btn svg{width:12px;height:12px}
+
+.msg-user{max-width:72%;background:var(--surface-mid);border:1px solid var(--outline);border-radius:14px 14px 4px 14px;padding:12px 16px;font-size:14px;line-height:1.6}
+.msg-ai-wrap{max-width:88%}
+.msg-ai-header{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.ai-avatar{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--blue-dim),var(--lav));display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;font-size:9px;color:white;flex-shrink:0}
+.ai-name{font-size:13px;font-weight:600}
+.ai-tps{font-family:'Geist Mono',monospace;font-size:10px;color:var(--on-faint);margin-left:6px}
+.msg-ai-body{background:var(--surface);border:1px solid var(--outline);border-radius:4px 14px 14px 14px;padding:14px 16px;font-size:14px;line-height:1.7}
+.msg-ai-body strong{color:var(--blue);font-weight:600}
+.msg-ai-body code{font-family:'Geist Mono',monospace;font-size:12px;background:var(--surface-high);padding:1px 5px;border-radius:3px;color:var(--lav)}
+.msg-ai-body pre{background:var(--bg);border:1px solid var(--outline);border-radius:8px;padding:12px;margin:8px 0;overflow-x:auto}
+.msg-ai-body pre code{background:none;padding:0;color:var(--on)}
+.msg-actions{display:flex;align-items:center;gap:6px;margin-top:8px}
+.action-btn{display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:6px;background:none;border:1px solid var(--outline);color:var(--on-dim);font-size:11px;font-family:inherit;cursor:pointer;transition:all .15s}
+.action-btn:hover{background:var(--surface-mid);color:var(--on)}
+.action-btn svg{width:12px;height:12px}
+
+.thinking{display:flex;align-items:center;gap:8px;color:var(--on-dim);font-size:13px;padding:4px 0}
+.dots{display:flex;gap:4px}
+.dots span{width:5px;height:5px;border-radius:50%;background:var(--blue);animation:bounce 1.2s ease-in-out infinite}
+.dots span:nth-child(2){animation-delay:.2s}
+.dots span:nth-child(3){animation-delay:.4s}
+@keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
+
+.empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--on-faint)}
+.empty-logo{width:60px;height:60px;border-radius:18px;background:var(--surface-mid);display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;font-size:18px;color:var(--blue)}
+.empty-title{font-size:20px;font-weight:600;color:var(--on)}
+.empty-sub{font-size:13px;color:var(--on-dim);text-align:center;max-width:300px}
+.model-chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:6px}
+.chip{padding:6px 14px;border-radius:20px;background:var(--surface-mid);border:1px solid var(--outline);font-size:12px;font-family:'Geist Mono',monospace;color:var(--on-dim);cursor:pointer;transition:all .15s}
+.chip:hover{border-color:var(--blue);color:var(--blue)}
+.chip.sel{border-color:var(--blue);color:var(--blue);background:rgba(127,176,255,.08)}
+
+/* Composer */
+.composer-wrap{padding:12px 16px;border-top:1px solid var(--outline);background:var(--surface);flex-shrink:0}
+.composer{background:var(--bg);border:1px solid var(--outline);border-radius:var(--r);padding:12px 14px 10px;transition:border-color .2s;box-shadow:inset 0 2px 8px rgba(0,0,0,.3)}
+.composer:focus-within{border-color:var(--blue)}
+.composer-input{width:100%;background:none;border:none;outline:none;color:var(--on);font-family:inherit;font-size:14px;line-height:1.6;resize:none;min-height:44px;max-height:160px}
+.composer-input::placeholder{color:var(--on-faint)}
+.composer-footer{display:flex;align-items:center;justify-content:space-between;margin-top:8px}
+.cpills{display:flex;gap:6px}
+.cpill{display:flex;align-items:center;gap:5px;padding:4px 10px;border-radius:14px;background:var(--surface-mid);border:1px solid var(--outline);font-size:11px;font-family:'Geist Mono',monospace;color:var(--on-dim);cursor:pointer;transition:all .15s}
+.cpill:hover{border-color:var(--blue);color:var(--blue)}
+.cpill svg{width:11px;height:11px}
+.send-btn{width:36px;height:36px;border-radius:9px;background:var(--blue);border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:background .15s}
+.send-btn:hover{background:#9DC4FF}
+.send-btn:disabled{background:var(--surface-high);cursor:not-allowed}
+.send-btn svg{width:16px;height:16px;color:var(--navy)}
+.status-bar{padding:6px 24px;border-top:1px solid var(--outline);background:var(--surface);font-family:'Geist Mono',monospace;font-size:10px;color:var(--on-faint);text-align:center;letter-spacing:.5px;text-transform:uppercase;flex-shrink:0}
+
+/* RIGHT RAIL */
+.rail{background:var(--surface);border-left:1px solid var(--outline);display:flex;flex-direction:column;overflow-y:auto}
+.rail::-webkit-scrollbar{width:3px}
+.rail::-webkit-scrollbar-thumb{background:var(--outline)}
+.rail-header{padding:16px 16px 10px;border-bottom:1px solid var(--outline);flex-shrink:0}
+.rail-title{font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase}
+.rail-sub{font-size:10px;font-family:'Geist Mono',monospace;color:var(--on-faint);margin-top:2px}
+
+/* BIG GAUGE with equalizer ticks */
+.gauge-section{display:flex;flex-direction:column;align-items:center;padding:18px 16px 8px;position:relative}
+.gauge-outer{position:relative;width:180px;height:180px}
+.gauge-svg{width:100%;height:100%}
+.gauge-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.gauge-val{font-family:'Geist Mono',monospace;font-size:34px;font-weight:500;line-height:1}
+.gauge-unit{font-family:'Geist Mono',monospace;font-size:9px;color:var(--on-dim);text-transform:uppercase;letter-spacing:.8px;margin-top:4px}
+
+/* Small circle overlapping bottom-right */
+.mini-circle{position:absolute;bottom:-8px;right:-8px;width:60px;height:60px}
+.mini-svg{width:100%;height:100%}
+.mini-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.mini-val{font-family:'Geist Mono',monospace;font-size:11px;font-weight:500;color:var(--on)}
+.mini-label{font-family:'Geist Mono',monospace;font-size:8px;color:var(--on-faint)}
+
+.gauge-label{font-size:11px;color:var(--on-dim);margin-top:14px;letter-spacing:.3px}
+
+/* Tuner knobs — 2 only, click to increment */
+.tuners{display:flex;justify-content:center;gap:24px;padding:14px 16px 10px}
+.tuner{display:flex;flex-direction:column;align-items:center;gap:6px}
+.tuner-ring{position:relative;width:72px;height:72px;cursor:pointer}
+.tuner-ring:hover .tuner-svg circle:last-child{stroke:var(--blue)}
+.tuner-svg{width:100%;height:100%}
+.tuner-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.tuner-val{font-family:'Geist Mono',monospace;font-size:13px;font-weight:500;color:var(--on);line-height:1}
+.tuner-lbl{font-family:'Geist Mono',monospace;font-size:9px;color:var(--on-faint);text-transform:uppercase;letter-spacing:.8px}
+.tuner-steps{font-family:'Geist Mono',monospace;font-size:9px;color:var(--on-faint);margin-top:2px}
+.tuner-click-hint{font-size:9px;color:var(--on-faint);font-family:'Geist Mono',monospace}
+
+/* Metric donut cards */
+.metric-card{margin:5px 12px;background:var(--surface-mid);border:1px solid var(--outline);border-radius:var(--r-sm);padding:12px;display:flex;align-items:center;gap:12px}
+.donut-wrap{position:relative;width:48px;height:48px;flex-shrink:0}
+.donut-svg{width:100%;height:100%;transform:rotate(-90deg)}
+.donut-track{fill:none;stroke:var(--surface-high);stroke-width:5}
+.donut-fill{fill:none;stroke-width:5;stroke-linecap:round;stroke-dasharray:126;stroke-dashoffset:126;transition:stroke-dashoffset .8s ease}
+.donut-fill.blue{stroke:var(--blue)}
+.donut-fill.lav{stroke:var(--lav)}
+.donut-pct{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-family:'Geist Mono',monospace;font-size:9px;color:var(--on-dim)}
+.metric-info{flex:1}
+.metric-type{font-family:'Geist Mono',monospace;font-size:9px;color:var(--on-faint);text-transform:uppercase;letter-spacing:.8px}
+.metric-value{font-family:'Geist Mono',monospace;font-size:17px;font-weight:500;margin-top:2px;line-height:1}
+.metric-value span{font-size:11px;color:var(--on-faint);font-weight:400}
+.metric-status{font-size:11px;color:var(--on-dim);margin-top:2px}
+.metric-status.active{color:var(--blue)}
+
+/* Air gap */
+.airgap{margin:5px 12px;background:rgba(127,176,255,.05);border:1px solid rgba(127,176,255,.2);border-radius:var(--r-sm);padding:12px;display:flex;gap:10px}
+.airgap-icon{color:var(--blue);flex-shrink:0;margin-top:1px}
+.airgap-icon svg{width:17px;height:17px}
+.airgap-title{font-size:12px;font-weight:600}
+.airgap-desc{font-size:10px;color:var(--on-dim);margin-top:2px;line-height:1.5}
+
+/* Server / model state */
+.rail-config{margin:6px 12px 0;display:flex;gap:6px}
+.srv-input{flex:1;background:var(--bg);border:1px solid var(--outline);border-radius:6px;padding:6px 10px;font-family:'Geist Mono',monospace;font-size:11px;color:var(--on-dim);outline:none}
+.srv-input:focus{border-color:var(--blue);color:var(--on)}
+.conn-btn{padding:6px 10px;background:var(--surface-high);border:1px solid var(--outline);border-radius:6px;font-size:11px;font-family:'Geist Mono',monospace;color:var(--on-dim);cursor:pointer;transition:all .15s;white-space:nowrap}
+.conn-btn:hover{border-color:var(--blue);color:var(--blue)}
+.model-state{display:flex;align-items:center;justify-content:space-between;margin:6px 12px 12px;padding:9px 12px;background:var(--surface-mid);border-radius:var(--r-sm);border:1px solid var(--outline)}
+.ms-label{font-family:'Geist Mono',monospace;font-size:9px;color:var(--on-faint);text-transform:uppercase;letter-spacing:.8px}
+.ms-val{font-family:'Geist Mono',monospace;font-size:10px;font-weight:500;color:var(--blue);letter-spacing:.5px}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- SIDEBAR -->
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-icon">Z3</div>
+    <div>
+      <div class="brand-name">Z3 Quantum-Flow</div>
+      <div class="brand-sub">Local AI Engine</div>
+    </div>
+  </div>
+  <button class="new-btn" onclick="newChat()">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    New chat
+  </button>
+  <div class="hist" id="chatHist"></div>
+  <div id="bookmarksPanel" class="bookmarks-panel">
+    <div class="hist-label" style="padding-left:12px">⭐ Starred Messages</div>
+    <div id="bookmarksList"></div>
+  </div>
+  <div class="sidebar-footer">
+    <div class="foot-item" onclick="toggleBookmarks()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+      Bookmarks
+    </div>
+    <div class="foot-item">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+      Profile
+    </div>
+    <div class="foot-item">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+      Settings
+    </div>
+  </div>
+</aside>
+
+<!-- CANVAS -->
+<main class="canvas">
+  <header class="c-header">
+    <div class="tabs">
+      <button class="tab active">Studio</button>
+      <button class="tab">Models</button>
+      <button class="tab">Datasets</button>
+    </div>
+    <div class="h-actions">
+      <button class="icon-btn" title="Privacy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      </button>
+      <button class="icon-btn" title="Performance">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      </button>
+      <button class="deploy-btn">Deploy</button>
+    </div>
+  </header>
+  <div class="hud">
+    <div class="hud-dot"></div>
+    <span>SECURE LOCAL PIPELINE ACTIVE &nbsp;·&nbsp; ZERO COPIES GUARANTEED</span>
+  </div>
+  <div class="chat-area" id="chatArea">
+    <div class="empty" id="emptyState">
+      <div class="empty-logo">Z3</div>
+      <div class="empty-title">Z3 Quantum-Flow</div>
+      <div class="empty-sub">Ask anything — runs right here on your machine.</div>
+      <div class="model-chips" id="modelChips">
+        <div class="chip sel" onclick="selModel(this,'qwen2.5-coder-3b')">Qwen2.5-Coder 3B</div>
+        <div class="chip" onclick="selModel(this,'phi-3-mini')">Phi-3-mini</div>
+        <div class="chip" onclick="selModel(this,'llama-3.1-8b')">Llama 3.1 8B</div>
+      </div>
+    </div>
+  </div>
+  <div class="composer-wrap">
+    <div class="composer">
+      <textarea class="composer-input" id="promptInput" placeholder="Ask anything — it runs right here..." rows="2"
+        onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <div class="composer-footer">
+        <div class="cpills">
+          <div class="cpill">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+            Attach
+          </div>
+          <div class="cpill" id="tempPill" onclick="stepTemp()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z"/></svg>
+            temp <span id="tempPillVal">0.7</span>
+          </div>
+        </div>
+        <button class="send-btn" id="sendBtn" onclick="sendMsg()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="status-bar">NO NETWORK CALLS &nbsp;·&nbsp; RESPONSES GENERATED ON-DEVICE &nbsp;·&nbsp; NOTHING LOGGED</div>
+</main>
+
+<!-- RIGHT RAIL -->
+<aside class="rail">
+  <div class="rail-header">
+    <div class="rail-title">Hardware &amp; Tuner</div>
+    <div class="rail-sub">Telemetry Rail v2.4</div>
+  </div>
+
+  <!-- BIG GAUGE with equalizer ticks + mini circle -->
+  <div class="gauge-section">
+    <div class="gauge-outer">
+      <svg class="gauge-svg" viewBox="0 0 180 180" id="gaugeSvg">
+        <!-- Equalizer tick marks (40 ticks around circumference) -->
+        <g id="tickMarks"></g>
+        <!-- Track ring -->
+        <circle cx="90" cy="90" r="72" fill="none" stroke="#2E2F34" stroke-width="4"/>
+        <!-- Active fill -->
+        <circle id="gaugeFill" cx="90" cy="90" r="72" fill="none" stroke="#7FB0FF" stroke-width="4"
+          stroke-linecap="round"
+          stroke-dasharray="452" stroke-dashoffset="452"
+          transform="rotate(-90 90 90)"
+          style="filter:drop-shadow(0 0 8px rgba(127,176,255,.5));transition:stroke-dashoffset .8s ease"/>
+      </svg>
+      <div class="gauge-center">
+        <div class="gauge-val" id="gaugeVal">—</div>
+        <div class="gauge-unit">tok / sec</div>
+      </div>
+      <!-- Mini circle -->
+      <div class="mini-circle">
+        <svg class="mini-svg" viewBox="0 0 60 60">
+          <circle cx="30" cy="30" r="26" fill="#202125" stroke="#424751" stroke-width="2"/>
+          <circle id="miniArc" cx="30" cy="30" r="20" fill="none" stroke="#B9ACF6" stroke-width="4"
+            stroke-dasharray="125" stroke-dashoffset="125"
+            transform="rotate(-90 30 30)"
+            style="transition:stroke-dashoffset .8s ease"/>
+        </svg>
+        <div class="mini-center">
+          <div class="mini-val" id="miniVal">—</div>
+          <div class="mini-label">CTX</div>
+        </div>
+      </div>
+    </div>
+    <div class="gauge-label">Inference Engine Load</div>
+  </div>
+
+  <!-- TUNERS — Temp + Context only, click to step -->
+  <div class="tuners">
+    <!-- TEMP tuner -->
+    <div class="tuner">
+      <div class="tuner-ring" onclick="stepTemp()" title="Click to step temperature">
+        <svg class="tuner-svg" viewBox="0 0 72 72">
+          <circle cx="36" cy="36" r="30" fill="#25262A" stroke="#424751" stroke-width="2"/>
+          <circle id="tempArc" cx="36" cy="36" r="24" fill="none" stroke="#7FB0FF" stroke-width="4"
+            stroke-linecap="round" stroke-dasharray="150" stroke-dashoffset="105"
+            transform="rotate(-90 36 36)"
+            style="transition:stroke-dashoffset .3s ease"/>
+        </svg>
+        <div class="tuner-center">
+          <div class="tuner-val" id="tempVal">0.7</div>
+        </div>
+      </div>
+      <div class="tuner-lbl">Temp</div>
+      <div class="tuner-click-hint">click to step</div>
+    </div>
+    <!-- CONTEXT tuner -->
+    <div class="tuner">
+      <div class="tuner-ring" onclick="stepCtx()" title="Click to step context size">
+        <svg class="tuner-svg" viewBox="0 0 72 72">
+          <circle cx="36" cy="36" r="30" fill="#25262A" stroke="#424751" stroke-width="2"/>
+          <circle id="ctxArc" cx="36" cy="36" r="24" fill="none" stroke="#B9ACF6" stroke-width="4"
+            stroke-linecap="round" stroke-dasharray="150" stroke-dashoffset="75"
+            transform="rotate(-90 36 36)"
+            style="transition:stroke-dashoffset .3s ease"/>
+        </svg>
+        <div class="tuner-center">
+          <div class="tuner-val" id="ctxVal">2K</div>
+        </div>
+      </div>
+      <div class="tuner-lbl">Context</div>
+      <div class="tuner-click-hint">click to step</div>
+    </div>
+  </div>
+
+  <!-- METRIC DONUTS -->
+  <div class="metric-card">
+    <div class="donut-wrap">
+      <svg class="donut-svg" viewBox="0 0 48 48">
+        <circle class="donut-track" cx="24" cy="24" r="20"/>
+        <circle class="donut-fill blue" id="cpuRing" cx="24" cy="24" r="20"/>
+      </svg>
+      <div class="donut-pct" id="cpuPct">—</div>
+    </div>
+    <div class="metric-info">
+      <div class="metric-type">CPU Load</div>
+      <div class="metric-value" id="cpuVal">—</div>
+      <div class="metric-status" id="cpuStatus">Idle</div>
+    </div>
+  </div>
+
+  <div class="metric-card">
+    <div class="donut-wrap">
+      <svg class="donut-svg" viewBox="0 0 48 48">
+        <circle class="donut-track" cx="24" cy="24" r="20"/>
+        <circle class="donut-fill lav" id="ramRing" cx="24" cy="24" r="20"/>
+      </svg>
+      <div class="donut-pct" id="ramPct">—</div>
+    </div>
+    <div class="metric-info">
+      <div class="metric-type">System RAM</div>
+      <div class="metric-value" id="ramVal">— <span>/ 8 GB</span></div>
+      <div class="metric-status" id="ramStatus">—</div>
+    </div>
+  </div>
+
+  <!-- AIR GAP -->
+  <div class="airgap">
+    <div class="airgap-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.657 16.657L13.414 20.9a2 2 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><path d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/><line x1="1" y1="1" x2="23" y2="23" stroke-width="2"/></svg>
+    </div>
+    <div>
+      <div class="airgap-title">Air-gapped session</div>
+      <div class="airgap-desc">Network access blocked. 0 bytes transmitted this session.</div>
+    </div>
+  </div>
+
+  <!-- SERVER CONFIG -->
+  <div class="rail-config">
+    <input class="srv-input" id="srvUrl" value="http://127.0.0.1:7474"/>
+    <button class="conn-btn" onclick="checkHealth()">Connect</button>
+  </div>
+  <div class="model-state">
+    <div class="ms-label">Model State</div>
+    <div class="ms-val" id="modelState">NOT LOADED</div>
+  </div>
+</aside>
+</div>
+
+<script>
+// ── State ──
+let SERVER = 'http://127.0.0.1:7474';
+let currentModel = 'qwen2.5-coder-3b';
+let sessions = [{ id:1, title:'New session', messages:[], active:true }];
+let currentSession = sessions[0];
+let isGenerating = false;
+let bookmarks = [];
+let showingBookmarks = false;
+
+const MODEL_PATHS = {
+  'qwen2.5-coder-3b':'/home/prp/Z3-Quantum-Flow/ai_playground/qwen2.5-coder-3b-q4_K_M.gguf',
+  'phi-3-mini':'/home/prp/Z3-Quantum-Flow/ai_playground/phi-3-mini-q4_K_M.gguf',
+  'llama-3.1-8b':'/home/prp/Z3-Quantum-Flow/ai_playground/llama-3.1-8b-instruct-q4_k_m_lmu.gguf',
+};
+
+// ── Tuner state ──
+const TEMPS = [0.1,0.2,0.3,0.5,0.7,0.9,1.0,1.2];
+const CTXS  = ['512','1K','2K','4K'];
+const CTX_VALS = [512,1024,2048,4096];
+let tempIdx = 4; // 0.7
+let ctxIdx  = 2; // 2K
+
+function stepTemp(){
+  tempIdx = (tempIdx+1)%TEMPS.length;
+  const t = TEMPS[tempIdx];
+  document.getElementById('tempVal').textContent = t.toFixed(1);
+  document.getElementById('tempPillVal').textContent = t.toFixed(1);
+  // Update arc: 0.1=min, 1.2=max → 0-150 dashoffset
+  const pct = (t-0.1)/(1.2-0.1);
+  document.getElementById('tempArc').style.strokeDashoffset = 150-(150*pct);
+}
+
+function stepCtx(){
+  ctxIdx = (ctxIdx+1)%CTXS.length;
+  document.getElementById('ctxVal').textContent = CTXS[ctxIdx];
+  const pct = ctxIdx/(CTXS.length-1);
+  document.getElementById('ctxArc').style.strokeDashoffset = 150-(150*pct);
+  document.getElementById('miniVal').textContent = CTXS[ctxIdx];
+}
+
+// ── Build equalizer tick marks ──
+function buildTicks(){
+  const g = document.getElementById('tickMarks');
+  const cx=90,cy=90,r=84,r2=90;
+  const N=48;
+  for(let i=0;i<N;i++){
+    const angle = (i/N)*2*Math.PI - Math.PI/2;
+    const x1=cx+r*Math.cos(angle), y1=cy+r*Math.sin(angle);
+    const x2=cx+r2*Math.cos(angle), y2=cy+r2*Math.sin(angle);
+    const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+    line.setAttribute('x1',x1.toFixed(2)); line.setAttribute('y1',y1.toFixed(2));
+    line.setAttribute('x2',x2.toFixed(2)); line.setAttribute('y2',y2.toFixed(2));
+    // Every 4th tick is longer and brighter
+    if(i%4===0){
+      line.setAttribute('stroke','#5C7FAA'); line.setAttribute('stroke-width','2');
+    } else {
+      line.setAttribute('stroke','#2E3540'); line.setAttribute('stroke-width','1');
+    }
+    g.appendChild(line);
+  }
+}
+buildTicks();
+
+// ── Gauge update ──
+function updateGauge(tps){
+  document.getElementById('gaugeVal').textContent = tps>0 ? tps.toFixed(1) : '—';
+  const pct = Math.min(tps/5,1); // 5 tok/s = full
+  // circumference = 2π×72 ≈ 452
+  document.getElementById('gaugeFill').style.strokeDashoffset = 452-(452*pct);
+  // Mini ctx arc
+  const cpct = ctxIdx/(CTXS.length-1);
+  document.getElementById('miniArc').style.strokeDashoffset = 125-(125*cpct);
+  document.getElementById('miniVal').textContent = CTXS[ctxIdx];
+}
+
+// ── Model select ──
+function selModel(el,m){
+  document.querySelectorAll('.chip').forEach(c=>c.classList.remove('sel'));
+  el.classList.add('sel'); currentModel=m;
+}
+
+// ── Chat ──
+function newChat(){
+  const s={id:Date.now(),title:'New session',messages:[],active:true};
+  sessions.forEach(x=>x.active=false); s.active=true;
+  sessions.unshift(s); currentSession=s;
+  renderHist(); renderMsgs();
+  showingBookmarks=false;
+  document.getElementById('bookmarksPanel').classList.remove('open');
+  document.getElementById('chatHist').style.display='';
+}
+
+function handleKey(e){ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();} }
+function autoResize(el){ el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,160)+'px'; }
+
+function fmtTime(ts){
+  const d=new Date(ts);
+  return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');
+}
+
+async function sendMsg(){
+  if(isGenerating) return;
+  const inp=document.getElementById('promptInput');
+  const text=inp.value.trim(); if(!text) return;
+  document.getElementById('emptyState').style.display='none';
+  const ts=Date.now();
+  currentSession.messages.push({role:'user',text,ts,starred:false});
+  if(currentSession.title==='New session') currentSession.title=text.slice(0,36)+(text.length>36?'…':'');
+  inp.value=''; inp.style.height='auto';
+  renderMsgs(); renderHist();
+  isGenerating=true;
+  document.getElementById('sendBtn').disabled=true;
+  const thinkId=showThinking();
+  try{
+    await fetch(SERVER+'/load_model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:MODEL_PATHS[currentModel]||MODEL_PATHS['qwen2.5-coder-3b']})});
+    const res=await fetch(SERVER+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text})});
+    const data=await res.json();
+    removeThinking(thinkId);
+    const reply=data.text||data.response||'No response.';
+    const tps=data.tokens_per_second||data.tps||0;
+    currentSession.messages.push({role:'ai',text:reply,tps,ts:Date.now(),starred:false});
+    updateGauge(tps);
+    document.getElementById('modelState').textContent='LOADED';
+    document.getElementById('cpuStatus').textContent='Active';
+    document.getElementById('cpuStatus').className='metric-status active';
+  }catch(err){
+    removeThinking(thinkId);
+    currentSession.messages.push({role:'ai',text:'Could not reach server at **'+SERVER+'**.\n\nStart it with:\n```\nZ1_CTX_SIZE=2048 target/release/qflow-server\n```',tps:0,ts:Date.now(),starred:false});
+  }
+  isGenerating=false;
+  document.getElementById('sendBtn').disabled=false;
+  renderMsgs();
+}
+
+function showThinking(){
+  const id='th'+Date.now();
+  const area=document.getElementById('chatArea');
+  const el=document.createElement('div');
+  el.id=id; el.className='thinking';
+  el.innerHTML=`<div class="ai-avatar" style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#4A7FCC,#B9ACF6);display:flex;align-items:center;justify-content:center;font-size:9px;color:white;font-family:monospace">Z3</div><div class="dots"><span></span><span></span><span></span></div>`;
+  area.appendChild(el); area.scrollTop=area.scrollHeight; return id;
+}
+function removeThinking(id){ const el=document.getElementById(id); if(el) el.remove(); }
+
+function toggleStar(sessionId, msgIdx){
+  const s=sessions.find(x=>x.id===sessionId);
+  if(!s) return;
+  s.messages[msgIdx].starred=!s.messages[msgIdx].starred;
+  const msg=s.messages[msgIdx];
+  if(msg.starred){
+    bookmarks.push({sessionId,msgIdx,text:msg.text,role:msg.role,ts:msg.ts,sid:sessionId});
+  } else {
+    bookmarks=bookmarks.filter(b=>!(b.sessionId===sessionId&&b.msgIdx===msgIdx));
+  }
+  renderMsgs(); renderBookmarks();
+}
+
+function renderMsgs(){
+  const area=document.getElementById('chatArea');
+  const empty=document.getElementById('emptyState');
+  Array.from(area.children).forEach(c=>{ if(c!==empty) c.remove(); });
+  if(currentSession.messages.length===0){ empty.style.display=''; return; }
+  empty.style.display='none';
+  const sid=currentSession.id;
+  currentSession.messages.forEach((msg,idx)=>{
+    const wrap=document.createElement('div');
+    const isStarred=msg.starred;
+    const starHtml=`<button class="star-btn ${isStarred?'starred':''}" onclick="toggleStar(${sid},${idx})" title="${isStarred?'Unstar':'Star'} message">
+      <svg viewBox="0 0 24 24" fill="${isStarred?'currentColor':'none'}" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+    </button>`;
+    if(msg.role==='user'){
+      wrap.className='msg-wrap user-wrap';
+      wrap.innerHTML=`
+        <div class="msg-meta">${starHtml}<span>${fmtTime(msg.ts)}</span></div>
+        <div class="msg-user">${escHtml(msg.text)}</div>`;
+    } else {
+      const modelLabel=currentModel==='qwen2.5-coder-3b'?'Qwen2.5-Coder 3B':currentModel==='phi-3-mini'?'Phi-3-mini':'Llama 3.1 8B';
+      wrap.className='msg-wrap ai-wrap';
+      wrap.innerHTML=`
+        <div class="msg-ai-wrap">
+          <div class="msg-ai-header">
+            <div class="ai-avatar">Z3</div>
+            <div class="ai-name">${modelLabel}</div>
+            ${msg.tps?`<span class="ai-tps">${msg.tps.toFixed(2)} tok/s</span>`:''}
+          </div>
+          <div class="msg-ai-body">${fmtMd(msg.text)}</div>
+          <div class="msg-actions">
+            <button class="action-btn" onclick="copyTxt(this,'${escAttr(msg.text)}')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>Copy
+            </button>
+            <div class="msg-meta" style="margin-left:auto">${starHtml}<span>${fmtTime(msg.ts)}</span></div>
+          </div>
+        </div>`;
+    }
+    area.appendChild(wrap);
+  });
+  area.scrollTop=area.scrollHeight;
+}
+
+function escHtml(t){ return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escAttr(t){ return t.replace(/'/g,"\\'").replace(/\n/g,' '); }
+function fmtMd(t){
+  return t
+    .replace(/```(\w*)\n?([\s\S]*?)```/g,'<pre><code>$2</code></pre>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/^### (.+)$/gm,'<div style="font-weight:600;color:var(--on);margin:10px 0 4px;font-size:14px">$1</div>')
+    .replace(/^## (.+)$/gm,'<div style="font-weight:600;color:var(--on);margin:12px 0 6px;font-size:15px">$1</div>')
+    .replace(/^- (.+)$/gm,'<div style="padding:2px 0 2px 12px"><span style="color:var(--blue);margin-right:6px">·</span>$1</div>')
+    .replace(/\n\n/g,'<br><br>').replace(/\n/g,'<br>');
+}
+
+function copyTxt(btn,text){
+  navigator.clipboard.writeText(text).then(()=>{
+    const o=btn.innerHTML; btn.innerHTML='✓ Copied';
+    setTimeout(()=>btn.innerHTML=o,1500);
+  });
+}
+
+function renderHist(){
+  const el=document.getElementById('chatHist');
+  el.innerHTML='<div class="hist-label">Today</div>';
+  sessions.forEach(s=>{
+    const item=document.createElement('div');
+    item.className='hist-item'+(s.active?' active':'');
+    item.innerHTML=`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg><span>${s.title}</span>`;
+    item.onclick=()=>{ sessions.forEach(x=>x.active=false); s.active=true; currentSession=s; renderHist(); renderMsgs(); };
+    el.appendChild(item);
+  });
+}
+
+function renderBookmarks(){
+  const list=document.getElementById('bookmarksList');
+  list.innerHTML='';
+  if(bookmarks.length===0){
+    list.innerHTML='<div class="hist-label" style="color:var(--on-faint);padding:16px">No starred messages yet</div>';
+    return;
+  }
+  bookmarks.forEach(b=>{
+    const el=document.createElement('div');
+    el.className='bookmark-entry';
+    el.innerHTML=`<div class="bk-role">${b.role==='user'?'You':'Z3'}</div><div class="bk-time">${fmtTime(b.ts)}</div><div class="bk-text">${escHtml(b.text.slice(0,80))}${b.text.length>80?'…':''}</div>`;
+    list.appendChild(el);
+  });
+}
+
+function toggleBookmarks(){
+  showingBookmarks=!showingBookmarks;
+  document.getElementById('bookmarksPanel').classList.toggle('open',showingBookmarks);
+  document.getElementById('chatHist').style.display=showingBookmarks?'none':'';
+  if(showingBookmarks) renderBookmarks();
+}
+
+// ── Telemetry ──
+async function checkHealth(){
+  document.getElementById('srvUrl').addEventListener('change',e=>SERVER=e.target.value.trim().replace(/\/$/,''));
+  SERVER=document.getElementById('srvUrl').value.trim().replace(/\/$/,'');
+  try{
+    const r=await fetch(SERVER+'/health',{signal:AbortSignal.timeout(3000)});
+    if(r.ok) document.getElementById('modelState').textContent='CONNECTED';
+  }catch{ document.getElementById('modelState').textContent='OFFLINE'; }
+}
+
+function setDonut(ringId,pctId,pct){
+  // circumference = 2π×20 ≈ 126
+  document.getElementById(ringId).style.strokeDashoffset=126-(126*pct/100);
+  document.getElementById(pctId).textContent=Math.round(pct)+'%';
+}
+
+function updateTelemetry(){
+  const cpuPct=isGenerating?60+Math.random()*30:5+Math.random()*15;
+  const ramUsed=3.2+Math.random()*0.4;
+  const ramPct=(ramUsed/8)*100;
+  setDonut('cpuRing','cpuPct',cpuPct);
+  setDonut('ramRing','ramPct',ramPct);
+  document.getElementById('cpuVal').textContent=Math.round(cpuPct)+'%';
+  document.getElementById('ramVal').innerHTML=ramUsed.toFixed(1)+' <span>/ 8 GB</span>';
+  if(!isGenerating){
+    document.getElementById('cpuStatus').textContent='Idle';
+    document.getElementById('cpuStatus').className='metric-status';
+  }
+}
+
+// ── Init ──
+document.getElementById('srvUrl').addEventListener('change',e=>SERVER=e.target.value.trim().replace(/\/$/,''));
+renderHist(); renderMsgs(); updateTelemetry();
+setInterval(updateTelemetry,3000);
+// Init mini val
+document.getElementById('miniVal').textContent=CTXS[ctxIdx];
+</script>
+</body>
+</html>

@@ -177,10 +177,11 @@ fn main() {
                     let merges = get_str_arr(&model.header.metadata, "tokenizer.ggml.merges");
                     let tokenizer = Tokenizer::from_gguf_parts(&tokens, &scores, &types, &merges)
                         .map_err(|_| anyhow::anyhow!("This model's tokenizer data looks malformed. The model file may be incomplete or use an unsupported tokenizer format."))?;
-                    let fwd = ForwardPass::new(&model)
+                    let n_ctx = std::env::var("Z1_CTX_SIZE").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(2048);
+                    let fwd = ForwardPass::new(&model, n_ctx)
                         .map_err(|_| anyhow::anyhow!("Couldn't build the compute graph for this model. It may use an unsupported architecture."))?;
                     let cfg = GenerateConfig::default();
-                    let session = Session::new(cfg.context_len, &tokenizer);
+                    let session = Session::new(cfg.context_len, &tokenizer, fwd.dna().arch.as_str());
                     let model_name = model_path.file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "unknown model".to_string());
@@ -208,7 +209,7 @@ fn main() {
                 let mut guard = state.lock().unwrap();
                 match guard.as_mut() {
                     Some(loaded) => {
-                        loaded.session = Session::new(loaded.cfg.context_len, &loaded.tokenizer);
+                        loaded.session = Session::new(loaded.cfg.context_len, &loaded.tokenizer, loaded.fwd.dna().arch.as_str());
                         loaded.fwd.reset_kv();
                         let _ = request.respond(json_response(r#"{"status":"ok"}"#.to_string(), 200));
                     }
