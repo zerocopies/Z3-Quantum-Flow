@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     cfg.context_len = ctx_size as usize;
 
     // 4. Initialize the Sliding-Window Session
-    let mut session = Session::new(cfg.context_len, &tokenizer);
+    let mut session = Session::new(cfg.context_len, &tokenizer, fwd.dna().arch.as_str());
 
     println!("[System] Engine ready. Context window: {} tokens.", cfg.context_len);
     println!("         Type '/exit' to quit or '/reset' to clear context.\n");

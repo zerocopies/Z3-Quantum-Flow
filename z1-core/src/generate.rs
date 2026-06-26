@@ -1,8 +1,10 @@
-// generate.rs — autoregressive generation loop for the B1 inference path
+// generate.rs — autoregressive generation loop
 //
-// Features a Sliding-Window KV Cache manager. When the conversation exceeds
-// the context limit, it drops the oldest conversation turns while preserving 
-// the system prompt, resets the KV cache, and seamlessly re-prefills.
+// Multi-architecture chat template support:
+//   Llama3 — uses token IDs 128000/128006/128007/128009
+//   Phi3   — uses text tokens <|system|>, <|user|>, <|assistant|>, <|end|>
+//   Qwen2  — uses text tokens <|im_start|>, <|im_end|>
+//   Raw    — BOS + raw text, no template (fallback)
 
 use std::io::{self, Write};
 use std::sync::OnceLock;
@@ -13,7 +15,6 @@ use crate::loader::MappedModel;
 use crate::logits::{sample_token, SamplingConfig, rng_seed_from_time, LogitError};
 use crate::tokenizer::Tokenizer;
 
-/// Returns true if Z1_TRACE=1 is set in the environment. Cached after first call.
 fn trace_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| std::env::var("Z1_TRACE").map(|v| v == "1").unwrap_or(false))
@@ -52,7 +53,7 @@ pub struct GenerateConfig {
 impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
-            max_new_tokens: 256, 
+            max_new_tokens: 256,
             sampling: SamplingConfig::default(),
             context_len: 512,
             print_timing: true,
@@ -91,6 +92,118 @@ impl std::fmt::Display for GenerateStats {
     }
 }
 
+// ── Chat template ─────────────────────────────────────────────────────────────
+
+/// Arch-aware chat template builder.
+/// Returns (system_tokens, user_turn_tokens, eos_token_id)
+struct ChatTemplate {
+    arch: String,
+}
+
+impl ChatTemplate {
+    fn new(arch: &str) -> Self {
+        Self { arch: arch.to_string() }
+    }
+
+    // Llama 3.1 special token IDs
+    const LLAMA_BOS:          u32 = 128_000;
+    const LLAMA_START_HEADER: u32 = 128_006;
+    const LLAMA_END_HEADER:   u32 = 128_007;
+    const LLAMA_EOT:          u32 = 128_009;
+    const LLAMA_NEWLINES:     u32 = 271;
+
+    fn build_system_tokens(&self, tok: &Tokenizer) -> Vec<u32> {
+        match self.arch.as_str() {
+            "llama" => {
+                let mut sys = vec![Self::LLAMA_BOS, Self::LLAMA_START_HEADER];
+                sys.extend_from_slice(&tok.encode_no_bos("system"));
+                sys.push(Self::LLAMA_END_HEADER);
+                sys.push(Self::LLAMA_NEWLINES);
+                sys.extend_from_slice(&tok.encode_no_bos("You are a highly capable AI assistant."));
+                sys.push(Self::LLAMA_EOT);
+                sys
+            }
+            "phi3" => {
+                // Phi-3 template: <|system|>\n{content}<|end|>\n
+                let mut sys = Vec::new();
+                sys.push(1u32); // BOS <s>
+                sys.extend_from_slice(&tok.encode_no_bos("<|system|>\n"));
+                sys.extend_from_slice(&tok.encode_no_bos("You are a helpful AI assistant."));
+                sys.extend_from_slice(&tok.encode_no_bos("<|end|>\n"));
+                sys
+            }
+            "qwen2" => {
+                // Qwen2 template: <|im_start|>system\n{content}<|im_end|>\n
+                let mut sys = Vec::new();
+                sys.extend_from_slice(&tok.encode_no_bos("<|im_start|>system\n"));
+                sys.extend_from_slice(&tok.encode_no_bos("You are a helpful AI assistant."));
+                sys.extend_from_slice(&tok.encode_no_bos("<|im_end|>\n"));
+                sys
+            }
+            _ => {
+                // Raw: just BOS
+                vec![1u32]
+            }
+        }
+    }
+
+    fn build_user_turn(&self, tok: &Tokenizer, user_message: &str) -> Vec<u32> {
+        match self.arch.as_str() {
+            "llama" => {
+                let mut turn = vec![Self::LLAMA_START_HEADER];
+                turn.extend_from_slice(&tok.encode_no_bos("user"));
+                turn.push(Self::LLAMA_END_HEADER);
+                turn.push(Self::LLAMA_NEWLINES);
+                turn.extend_from_slice(&tok.encode_no_bos(user_message));
+                turn.push(Self::LLAMA_EOT);
+                turn.push(Self::LLAMA_START_HEADER);
+                turn.extend_from_slice(&tok.encode_no_bos("assistant"));
+                turn.push(Self::LLAMA_END_HEADER);
+                turn.push(Self::LLAMA_NEWLINES);
+                turn
+            }
+            "phi3" => {
+                // <|user|>\n{msg}<|end|>\n<|assistant|>\n
+                let mut turn = Vec::new();
+                turn.extend_from_slice(&tok.encode_no_bos("<|user|>\n"));
+                turn.extend_from_slice(&tok.encode_no_bos(user_message));
+                turn.extend_from_slice(&tok.encode_no_bos("<|end|>\n"));
+                turn.extend_from_slice(&tok.encode_no_bos("<|assistant|>\n"));
+                turn
+            }
+            "qwen2" => {
+                // <|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n
+                let mut turn = Vec::new();
+                turn.extend_from_slice(&tok.encode_no_bos("<|im_start|>user\n"));
+                turn.extend_from_slice(&tok.encode_no_bos(user_message));
+                turn.extend_from_slice(&tok.encode_no_bos("<|im_end|>\n"));
+                turn.extend_from_slice(&tok.encode_no_bos("<|im_start|>assistant\n"));
+                turn
+            }
+            _ => {
+                // Raw: just tokenize the message
+                tok.encode_no_bos(user_message)
+            }
+        }
+    }
+
+    fn eot_token(&self, tok: &Tokenizer) -> u32 {
+        match self.arch.as_str() {
+            "llama" => Self::LLAMA_EOT,
+            "phi3"  => {
+                // <|end|> token — encode and take first token
+                let ids = tok.encode_no_bos("<|end|>");
+                ids.first().copied().unwrap_or(32007)
+            }
+            "qwen2" => {
+                let ids = tok.encode_no_bos("<|im_end|>");
+                ids.first().copied().unwrap_or(151645)
+            }
+            _ => 2, // generic EOS
+        }
+    }
+}
+
 // ── Core generation loop ──────────────────────────────────────────────────────
 
 fn run_generation(
@@ -99,8 +212,9 @@ fn run_generation(
     model: &MappedModel,
     tok: &Tokenizer,
     cfg: &GenerateConfig,
+    eot: u32,
 ) -> Result<(GenerateStats, Vec<u32>), GenerateError> {
-    let (stats, _text, generated_ids) = run_generation_inner(turn_ids, fwd, model, tok, cfg, false)?;
+    let (stats, _text, generated_ids) = run_generation_inner(turn_ids, fwd, model, tok, cfg, false, eot)?;
     Ok((stats, generated_ids))
 }
 
@@ -111,7 +225,8 @@ pub fn run_generation_captured(
     tok: &Tokenizer,
     cfg: &GenerateConfig,
 ) -> Result<(GenerateStats, String, Vec<u32>), GenerateError> {
-    run_generation_inner(turn_ids, fwd, model, tok, cfg, true)
+    // For captured mode we use a generic EOS — caller should use generate_turn_captured instead
+    run_generation_inner(turn_ids, fwd, model, tok, cfg, true, 2)
 }
 
 fn run_generation_inner(
@@ -121,6 +236,7 @@ fn run_generation_inner(
     tok: &Tokenizer,
     cfg: &GenerateConfig,
     quiet: bool,
+    eot: u32,
 ) -> Result<(GenerateStats, String, Vec<u32>), GenerateError> {
 
     if turn_ids.is_empty() { return Err(GenerateError::EmptyPrompt); }
@@ -128,7 +244,7 @@ fn run_generation_inner(
     let n_ctx  = fwd.kv.n_ctx;
     let used   = fwd.kv.head;
     let needed = turn_ids.len() as i64;
-    
+
     if used + needed > n_ctx {
         return Err(GenerateError::ContextFull { used: used + needed, max: n_ctx });
     }
@@ -142,20 +258,20 @@ fn run_generation_inner(
     let mut rng = rng_seed_from_time();
     let mut recent_tokens: Vec<u32> = Vec::new();
     let mut generated_ids: Vec<u32> = Vec::new();
-    
+
     let mut next_token = sample_token(&mut logits, &cfg.sampling, &recent_tokens, &mut rng)?;
 
     let gen_t0 = Instant::now();
     let mut generated = 0usize;
     let stdout = io::stdout();
     let mut text = String::new();
-    
+
     if !quiet { println!(); }
 
     loop {
-        if tok.is_eos(next_token) { break; }
+        if tok.is_eos(next_token) || next_token == eot { break; }
         if generated >= cfg.max_new_tokens { break; }
-        if fwd.kv.head >= n_ctx { break; } 
+        if fwd.kv.head >= n_ctx { break; }
 
         generated_ids.push(next_token);
 
@@ -179,19 +295,16 @@ fn run_generation_inner(
     }
 
     let generate_ms = gen_t0.elapsed().as_secs_f64() * 1000.0;
-    let stats = GenerateStats { prompt_tokens: prompt_token_count, generated_tokens: generated, prompt_ms, generate_ms };
+    let stats = GenerateStats {
+        prompt_tokens: prompt_token_count,
+        generated_tokens: generated,
+        prompt_ms,
+        generate_ms,
+    };
 
     if cfg.print_timing && !quiet { eprintln!("{stats}"); }
     Ok((stats, text, generated_ids))
 }
-
-// ── Llama 3.1 chat template ───────────────────────────────────────────────────
-
-const T_BOS:          u32 = 128_000; // <|begin_of_text|>
-const T_START_HEADER: u32 = 128_006; // <|start_header_id|>
-const T_END_HEADER:   u32 = 128_007; // <|end_header_id|>
-const T_EOT:          u32 = 128_009; // <|eot_id|>
-const T_NEWLINES:     u32 = 271;     // "\n\n"
 
 // ── Session (Sliding Window Manager) ──────────────────────────────────────────
 
@@ -200,27 +313,32 @@ pub struct Session {
     pub context_len: usize,
     pub system_tokens: Vec<u32>,
     pub history_tokens: Vec<u32>,
+    arch: String,
+    eot: u32,
 }
 
 impl Session {
-    pub fn new(context_len: usize, tok: &Tokenizer) -> Self {
-        let mut sys = vec![T_BOS, T_START_HEADER];
-        sys.extend_from_slice(&tok.encode_no_bos("system"));
-        sys.push(T_END_HEADER);
-        sys.push(T_NEWLINES); // FIX: Manually push the newline token boundary
-        sys.extend_from_slice(&tok.encode_no_bos("You are a highly capable AI assistant."));
-        sys.push(T_EOT);
+    /// arch — pass fwd.dna().arch.as_str() from main.rs
+    pub fn new(context_len: usize, tok: &Tokenizer, arch: &str) -> Self {
+        let tmpl = ChatTemplate::new(arch);
+        let system_tokens = tmpl.build_system_tokens(tok);
+        let eot = tmpl.eot_token(tok);
+
+        log::info!("[Z.3] Chat template: arch={} system_tokens={} eot={}",
+            arch, system_tokens.len(), eot);
 
         Self {
             turn_count: 0,
             context_len,
-            system_tokens: sys,
+            system_tokens,
             history_tokens: Vec::new(),
+            arch: arch.to_string(),
+            eot,
         }
     }
 
     pub fn is_empty(&self) -> bool { self.turn_count == 0 }
-    
+
     pub fn reset(&mut self) {
         self.turn_count = 0;
         self.history_tokens.clear();
@@ -240,21 +358,10 @@ pub fn generate_turn(
 
     if user_message.trim().is_empty() { return Err(GenerateError::EmptyPrompt); }
 
-    // 1. Format the new user message
-    let mut new_turn = vec![T_START_HEADER];
-    new_turn.extend_from_slice(&tok.encode_no_bos("user"));
-    new_turn.push(T_END_HEADER);
-    new_turn.push(T_NEWLINES); // FIX: Manually push the newline token boundary
-    new_turn.extend_from_slice(&tok.encode_no_bos(user_message));
-    new_turn.push(T_EOT);
+    let tmpl = ChatTemplate::new(&session.arch);
+    let new_turn = tmpl.build_user_turn(tok, user_message);
+    let eot = session.eot;
 
-    // Add assistant prompt header
-    new_turn.push(T_START_HEADER);
-    new_turn.extend_from_slice(&tok.encode_no_bos("assistant"));
-    new_turn.push(T_END_HEADER);
-    new_turn.push(T_NEWLINES);
-
-    // 2. Sliding Window Logic: Check if we are going to exceed RAM
     let needed_space = new_turn.len() + cfg.max_new_tokens;
     let available_space = session.context_len.saturating_sub(session.system_tokens.len());
 
@@ -264,43 +371,37 @@ pub fn generate_turn(
 
     let mut requires_reprefill = false;
 
-    // Slide the window: Drop oldest tokens until we have enough space
     while session.system_tokens.len() + session.history_tokens.len() + needed_space > session.context_len {
         let drop_amount = 128.min(session.history_tokens.len());
         session.history_tokens.drain(0..drop_amount);
         requires_reprefill = true;
     }
 
-    // 3. Update session memory with the new user message
     session.history_tokens.extend_from_slice(&new_turn);
 
-    // 4. Inject to KV Cache
     let mut tokens_to_process = Vec::new();
-    
+
     if requires_reprefill || session.turn_count == 0 {
-        // We had to drop old memory (or it's turn 1), so wipe the KV cache and reload
         fwd.reset_kv();
         tokens_to_process.extend_from_slice(&session.system_tokens);
         tokens_to_process.extend_from_slice(&session.history_tokens);
         if trace_enabled() { eprintln!("[Z.1] Sliding window activated. Re-prefilling context."); }
     } else {
-        // No memory dropped! We can seamlessly append this turn to the existing KV cache.
         tokens_to_process.extend_from_slice(&new_turn);
     }
 
     session.turn_count += 1;
 
-    // 5. Run Generation
-    let (stats, generated_ids) = run_generation(&tokens_to_process, fwd, model, tok, cfg)?;
+    let (stats, generated_ids) = run_generation(&tokens_to_process, fwd, model, tok, cfg, eot)?;
 
-    // 6. Save the AI's generated response into our session history so it remembers it next time
     session.history_tokens.extend_from_slice(&generated_ids);
-    session.history_tokens.push(T_EOT);
+    session.history_tokens.push(eot);
 
     Ok(stats)
 }
 
-// ── Captured variant for Desktop UI environments ─────────────────────────────
+// ── Captured variant for Desktop UI environments ──────────────────────────────
+
 pub fn generate_turn_captured(
     user_message: &str,
     session: &mut Session,
@@ -311,17 +412,9 @@ pub fn generate_turn_captured(
 ) -> Result<(GenerateStats, String), GenerateError> {
     if user_message.trim().is_empty() { return Err(GenerateError::EmptyPrompt); }
 
-    let mut new_turn = vec![T_START_HEADER];
-    new_turn.extend_from_slice(&tok.encode_no_bos("user"));
-    new_turn.push(T_END_HEADER);
-    new_turn.push(T_NEWLINES);
-    new_turn.extend_from_slice(&tok.encode_no_bos(user_message));
-    new_turn.push(T_EOT);
-
-    new_turn.push(T_START_HEADER);
-    new_turn.extend_from_slice(&tok.encode_no_bos("assistant"));
-    new_turn.push(T_END_HEADER);
-    new_turn.push(T_NEWLINES);
+    let tmpl = ChatTemplate::new(&session.arch);
+    let new_turn = tmpl.build_user_turn(tok, user_message);
+    let eot = session.eot;
 
     let needed_space = new_turn.len() + cfg.max_new_tokens;
     let available_space = session.context_len.saturating_sub(session.system_tokens.len());
@@ -351,11 +444,11 @@ pub fn generate_turn_captured(
 
     session.turn_count += 1;
 
-    // Direct execution right into the token capturer loop
-    let (stats, text, generated_ids) = run_generation_captured(&tokens_to_process, fwd, model, tok, cfg)?;
+    let (stats, text, generated_ids) = run_generation_inner(
+        &tokens_to_process, fwd, model, tok, cfg, true, eot)?;
 
     session.history_tokens.extend_from_slice(&generated_ids);
-    session.history_tokens.push(T_EOT);
+    session.history_tokens.push(eot);
 
     Ok((stats, text))
 }
