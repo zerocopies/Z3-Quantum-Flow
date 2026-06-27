@@ -26,7 +26,7 @@ use tiny_http::{Server, Response, Header, Method};
 use z3_quantum_flow::tokenizer::Tokenizer;
 use z3_quantum_flow::loader::MappedModel;
 use z3_quantum_flow::graph::ForwardPass;
-use z3_quantum_flow::generate::{Session, GenerateConfig, run_generation_captured};
+use z3_quantum_flow::generate::{Session, GenerateConfig, generate_turn_captured};
 use z3_quantum_flow::gguf::GgufValue;
 
 fn get_str_arr(metadata: &HashMap<String, GgufValue>, key: &str) -> Vec<String> {
@@ -54,10 +54,6 @@ struct LoadedModel {
     model_name: String,
 }
 
-const T_START_HEADER: u32 = 128_006;
-const T_END_HEADER: u32 = 128_007;
-const T_EOT: u32 = 128_009;
-const T_NEWLINES: u32 = 271;
 
 #[derive(Deserialize)]
 struct LoadRequest { path: String }
@@ -92,7 +88,7 @@ fn main() {
     env_logger::init();
     let state: Mutex<Option<LoadedModel>> = Mutex::new(None);
 
-    let addr = "127.0.0.1:7474";
+    let addr = "127.0.0.1:7475";
     let server = Server::http(addr).expect("failed to bind — is something already running on 7474?");
     println!("========================================");
     println!(" Inference Z1 — HTTP server");
@@ -249,53 +245,11 @@ fn main() {
                     continue;
                 }
 
-                let mut new_turn = vec![T_START_HEADER];
-                new_turn.extend_from_slice(&loaded.tokenizer.encode_no_bos("user"));
-                new_turn.push(T_END_HEADER);
-                new_turn.extend_from_slice(&loaded.tokenizer.encode_no_bos(&format!("\n\n{prompt}")));
-                new_turn.push(T_EOT);
-                new_turn.push(T_START_HEADER);
-                new_turn.extend_from_slice(&loaded.tokenizer.encode_no_bos("assistant"));
-                new_turn.push(T_END_HEADER);
-                new_turn.push(T_NEWLINES);
-
-                let needed_space = new_turn.len() + loaded.cfg.max_new_tokens;
-                let available_space = loaded.session.context_len.saturating_sub(loaded.session.system_tokens.len());
-                if needed_space > available_space {
-                    let _ = request.respond(json_response(
-                        serde_json::to_string(&ErrorResponse{error: format!("This conversation has gotten too long for the current context window ({} tokens). Try starting a new chat.", loaded.session.context_len)}).unwrap(), 400));
-                    continue;
-                }
-
-                let mut requires_reprefill = false;
-                while loaded.session.system_tokens.len() + loaded.session.history_tokens.len() + needed_space
-                    > loaded.session.context_len
-                {
-                    let drop_amount = 128.min(loaded.session.history_tokens.len());
-                    loaded.session.history_tokens.drain(0..drop_amount);
-                    requires_reprefill = true;
-                }
-
-                loaded.session.history_tokens.extend_from_slice(&new_turn);
-
-                let mut tokens_to_process = Vec::new();
-                if requires_reprefill || loaded.session.turn_count == 0 {
-                    loaded.fwd.reset_kv();
-                    tokens_to_process.extend_from_slice(&loaded.session.system_tokens);
-                    tokens_to_process.extend_from_slice(&loaded.session.history_tokens);
-                } else {
-                    tokens_to_process.extend_from_slice(&new_turn);
-                }
-                loaded.session.turn_count += 1;
-
-                let gen_result = run_generation_captured(
-                    &tokens_to_process, &mut loaded.fwd, &loaded.model, &loaded.tokenizer, &loaded.cfg);
+                let gen_result = generate_turn_captured(
+                    &prompt, &mut loaded.session, &mut loaded.fwd, &loaded.model, &loaded.tokenizer, &loaded.cfg);
 
                 match gen_result {
-                    Ok((stats, text, generated_ids)) => {
-                        loaded.session.history_tokens.extend_from_slice(&generated_ids);
-                        loaded.session.history_tokens.push(T_EOT);
-
+                    Ok((stats, text)) => {
                         let resp = ChatResponse {
                             text,
                             stats: format!("{} tokens · {:.2} tok/s", stats.generated_tokens, stats.tokens_per_second()),
