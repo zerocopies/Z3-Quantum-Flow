@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
+<!-- saved from url=(0022)http://127.0.0.1:7474/ -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Quantum-Flow · Local AI Engine</title>
-<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="./Quantum-Flow · Local AI Engine_files/css2" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -193,25 +193,25 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
     <div class="brand-name" style="font-size:20px;font-weight:600;letter-spacing:-0.5px">Quantum-Flow</div>
   </div>
   <button class="new-btn" onclick="newChat()">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
     New chat
   </button>
-  <div class="hist" id="chatHist"></div>
+  <div class="hist" id="chatHist"><div class="hist-label">Today</div><div class="hist-item active"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"></path></svg><span>New session</span></div></div>
   <div class="bk-panel" id="bkPanel">
     <div class="hist-label" style="padding-left:12px">⭐ Starred</div>
     <div id="bkList"></div>
   </div>
   <div class="sidebar-footer">
     <div class="foot-item" onclick="toggleBk()">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
       Bookmarks
     </div>
     <div class="foot-item">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"></circle><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"></path></svg>
       Profile
     </div>
     <div class="foot-item">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"></path></svg>
       Settings
     </div>
   </div>
@@ -229,18 +229,20 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
       <button class="tab">Datasets</button>
     </div>
     <div style="display:flex;align-items:center;gap:8px">
-      <select id="modelSelect" onchange="switchModel(this.value)" style="background:#252E40;border:1px solid #3A4454;border-radius:8px;padding:7px 12px;font-family:inherit;font-size:13px;color:#F8FAFC;cursor:pointer;outline:none;min-width:180px">
+      <select id="modelSelect" onchange="switchModel(this.value)" style="background:#252E40;border:1px solid #3A4454;border-radius:8px;padding:7px 12px;font-family:inherit;font-size:13px;color:#F8FAFC;cursor:pointer;outline:none;min-width:220px">
+        <option value="qwen2.5-coder-3b-abl">Qwen2.5-Coder 3B Abliterated</option>
         <option value="qwen2.5-coder-3b">Qwen2.5-Coder 3B</option>
         <option value="qwen2.5-coder-1.5b">Qwen2.5-Coder 1.5B</option>
+        <option value="llama-3.2-3b-uncensored">Llama 3.2 3B Uncensored</option>
         <option value="phi-3-mini">Phi-3-mini</option>
         <option value="llama-3.1-8b">Llama 3.1 8B</option>
       </select>
     </div>
     <div class="h-actions">
-      <button class="icon-btn" title="Collapse left panel" onclick="togglePanel('sidebar')" style="font-size:14px">&#8249;</button>
-      <button class="icon-btn" title="Collapse right panel" onclick="togglePanel('rail')" style="font-size:14px">&#8250;</button>
-      <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></button>
-      <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></button>
+      <button class="icon-btn" title="Collapse left panel" onclick="togglePanel(&#39;sidebar&#39;)" style="font-size:14px">‹</button>
+      <button class="icon-btn" title="Collapse right panel" onclick="togglePanel(&#39;rail&#39;)" style="font-size:14px">›</button>
+      <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg></button>
+      <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></button>
       <button class="deploy-btn">Deploy</button>
     </div>
   </header>
@@ -254,21 +256,21 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
   </div>
   <div class="composer-wrap">
     <div class="composer">
-      <textarea class="composer-input" id="promptInput" placeholder="Ask anything — it runs right here..." rows="2"
-        onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <textarea class="composer-input" id="promptInput" placeholder="Ask anything — it runs right here..." rows="2" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
       <div class="composer-footer">
         <div class="cpills">
-          <div class="cpill">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
-            Attach
+          <div class="cpill" onclick="document.getElementById(&#39;fileInput&#39;).click()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"></path></svg>
+            <span id="attachLabel">Attach</span>
           </div>
+          <input type="file" id="fileInput" style="display:none" accept=".txt,.md,.rs,.py,.js,.ts,.html,.css,.json,.toml,.yaml,.yml,.sh,.csv,.xml" onchange="handleFile(this)">
           <div class="cpill" onclick="stepTemp()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z"/></svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z"></path></svg>
             temp <span id="tempPillVal">0.7</span>
           </div>
         </div>
         <button class="send-btn" id="sendBtn" onclick="sendMsg()">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
         </button>
       </div>
     </div>
@@ -288,12 +290,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
   <div class="gauge-section">
     <div class="gauge-outer">
       <svg class="gauge-svg" viewBox="0 0 180 180">
-        <g id="tickMarks"></g>
-        <circle cx="90" cy="90" r="72" fill="none" stroke="#2E2F34" stroke-width="4"/>
-        <circle id="gaugeFill" cx="90" cy="90" r="72" fill="none" stroke="#00A3A6" stroke-width="4"
-          stroke-linecap="round" stroke-dasharray="452" stroke-dashoffset="452"
-          transform="rotate(-90 90 90)"
-          style="filter:drop-shadow(0 0 8px rgba(127,176,255,.5));transition:stroke-dashoffset .8s ease"/>
+        <g id="tickMarks"><line x1="90.00" y1="8.00" x2="90.00" y2="0.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="101.09" y1="5.73" x2="101.75" y2="0.77" stroke="#2E3540" stroke-width="1"></line><line x1="112.00" y1="7.90" x2="113.29" y2="3.07" stroke="#2E3540" stroke-width="1"></line><line x1="122.53" y1="11.47" x2="124.44" y2="6.85" stroke="#2E3540" stroke-width="1"></line><line x1="131.00" y1="18.99" x2="135.00" y2="12.06" stroke="#5C7FAA" stroke-width="2"></line><line x1="141.74" y1="22.56" x2="144.79" y2="18.60" stroke="#2E3540" stroke-width="1"></line><line x1="150.10" y1="29.90" x2="153.64" y2="26.36" stroke="#2E3540" stroke-width="1"></line><line x1="157.44" y1="38.26" x2="161.40" y2="35.21" stroke="#2E3540" stroke-width="1"></line><line x1="161.01" y1="49.00" x2="167.94" y2="45.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="168.53" y1="57.47" x2="173.15" y2="55.56" stroke="#2E3540" stroke-width="1"></line><line x1="172.10" y1="68.00" x2="176.93" y2="66.71" stroke="#2E3540" stroke-width="1"></line><line x1="174.27" y1="78.91" x2="179.23" y2="78.25" stroke="#2E3540" stroke-width="1"></line><line x1="172.00" y1="90.00" x2="180.00" y2="90.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="174.27" y1="101.09" x2="179.23" y2="101.75" stroke="#2E3540" stroke-width="1"></line><line x1="172.10" y1="112.00" x2="176.93" y2="113.29" stroke="#2E3540" stroke-width="1"></line><line x1="168.53" y1="122.53" x2="173.15" y2="124.44" stroke="#2E3540" stroke-width="1"></line><line x1="161.01" y1="131.00" x2="167.94" y2="135.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="157.44" y1="141.74" x2="161.40" y2="144.79" stroke="#2E3540" stroke-width="1"></line><line x1="150.10" y1="150.10" x2="153.64" y2="153.64" stroke="#2E3540" stroke-width="1"></line><line x1="141.74" y1="157.44" x2="144.79" y2="161.40" stroke="#2E3540" stroke-width="1"></line><line x1="131.00" y1="161.01" x2="135.00" y2="167.94" stroke="#5C7FAA" stroke-width="2"></line><line x1="122.53" y1="168.53" x2="124.44" y2="173.15" stroke="#2E3540" stroke-width="1"></line><line x1="112.00" y1="172.10" x2="113.29" y2="176.93" stroke="#2E3540" stroke-width="1"></line><line x1="101.09" y1="174.27" x2="101.75" y2="179.23" stroke="#2E3540" stroke-width="1"></line><line x1="90.00" y1="172.00" x2="90.00" y2="180.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="78.91" y1="174.27" x2="78.25" y2="179.23" stroke="#2E3540" stroke-width="1"></line><line x1="68.00" y1="172.10" x2="66.71" y2="176.93" stroke="#2E3540" stroke-width="1"></line><line x1="57.47" y1="168.53" x2="55.56" y2="173.15" stroke="#2E3540" stroke-width="1"></line><line x1="49.00" y1="161.01" x2="45.00" y2="167.94" stroke="#5C7FAA" stroke-width="2"></line><line x1="38.26" y1="157.44" x2="35.21" y2="161.40" stroke="#2E3540" stroke-width="1"></line><line x1="29.90" y1="150.10" x2="26.36" y2="153.64" stroke="#2E3540" stroke-width="1"></line><line x1="22.56" y1="141.74" x2="18.60" y2="144.79" stroke="#2E3540" stroke-width="1"></line><line x1="18.99" y1="131.00" x2="12.06" y2="135.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="11.47" y1="122.53" x2="6.85" y2="124.44" stroke="#2E3540" stroke-width="1"></line><line x1="7.90" y1="112.00" x2="3.07" y2="113.29" stroke="#2E3540" stroke-width="1"></line><line x1="5.73" y1="101.09" x2="0.77" y2="101.75" stroke="#2E3540" stroke-width="1"></line><line x1="8.00" y1="90.00" x2="0.00" y2="90.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="5.73" y1="78.91" x2="0.77" y2="78.25" stroke="#2E3540" stroke-width="1"></line><line x1="7.90" y1="68.00" x2="3.07" y2="66.71" stroke="#2E3540" stroke-width="1"></line><line x1="11.47" y1="57.47" x2="6.85" y2="55.56" stroke="#2E3540" stroke-width="1"></line><line x1="18.99" y1="49.00" x2="12.06" y2="45.00" stroke="#5C7FAA" stroke-width="2"></line><line x1="22.56" y1="38.26" x2="18.60" y2="35.21" stroke="#2E3540" stroke-width="1"></line><line x1="29.90" y1="29.90" x2="26.36" y2="26.36" stroke="#2E3540" stroke-width="1"></line><line x1="38.26" y1="22.56" x2="35.21" y2="18.60" stroke="#2E3540" stroke-width="1"></line><line x1="49.00" y1="18.99" x2="45.00" y2="12.06" stroke="#5C7FAA" stroke-width="2"></line><line x1="57.47" y1="11.47" x2="55.56" y2="6.85" stroke="#2E3540" stroke-width="1"></line><line x1="68.00" y1="7.90" x2="66.71" y2="3.07" stroke="#2E3540" stroke-width="1"></line><line x1="78.91" y1="5.73" x2="78.25" y2="0.77" stroke="#2E3540" stroke-width="1"></line></g>
+        <circle cx="90" cy="90" r="72" fill="none" stroke="#2E2F34" stroke-width="4"></circle>
+        <circle id="gaugeFill" cx="90" cy="90" r="72" fill="none" stroke="#00A3A6" stroke-width="4" stroke-linecap="round" stroke-dasharray="452" stroke-dashoffset="452" transform="rotate(-90 90 90)" style="filter:drop-shadow(0 0 8px rgba(127,176,255,.5));transition:stroke-dashoffset .8s ease"></circle>
       </svg>
       <div class="gauge-center">
         <div class="gauge-val" id="gaugeVal">—</div>
@@ -301,10 +300,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
       </div>
       <div class="mini-circle">
         <svg class="mini-svg" viewBox="0 0 60 60">
-          <circle cx="30" cy="30" r="26" fill="#202125" stroke="#424751" stroke-width="2"/>
-          <circle id="miniArc" cx="30" cy="30" r="20" fill="none" stroke="#CCE829" stroke-width="4"
-            stroke-dasharray="125" stroke-dashoffset="62"
-            transform="rotate(-90 30 30)" style="transition:stroke-dashoffset .8s ease"/>
+          <circle cx="30" cy="30" r="26" fill="#202125" stroke="#424751" stroke-width="2"></circle>
+          <circle id="miniArc" cx="30" cy="30" r="20" fill="none" stroke="#CCE829" stroke-width="4" stroke-dasharray="125" stroke-dashoffset="62" transform="rotate(-90 30 30)" style="transition:stroke-dashoffset .8s ease"></circle>
         </svg>
         <div class="mini-center">
           <div class="mini-val" id="miniVal">2K</div>
@@ -318,10 +315,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
     <div class="tuner">
       <div class="tuner-ring" onclick="stepTemp()">
         <svg class="tuner-svg" viewBox="0 0 72 72">
-          <circle cx="36" cy="36" r="30" fill="#25262A" stroke="#424751" stroke-width="2"/>
-          <circle id="tempArc" cx="36" cy="36" r="24" fill="none" stroke="#00A3A6" stroke-width="4"
-            stroke-linecap="round" stroke-dasharray="150" stroke-dashoffset="87"
-            transform="rotate(-90 36 36)" style="transition:stroke-dashoffset .3s ease"/>
+          <circle cx="36" cy="36" r="30" fill="#25262A" stroke="#424751" stroke-width="2"></circle>
+          <circle id="tempArc" cx="36" cy="36" r="24" fill="none" stroke="#00A3A6" stroke-width="4" stroke-linecap="round" stroke-dasharray="150" stroke-dashoffset="87" transform="rotate(-90 36 36)" style="transition:stroke-dashoffset .3s ease"></circle>
         </svg>
         <div class="tuner-center"><div class="tuner-val" id="tempVal">0.7</div></div>
       </div>
@@ -331,10 +326,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
     <div class="tuner">
       <div class="tuner-ring" onclick="stepCtx()">
         <svg class="tuner-svg" viewBox="0 0 72 72">
-          <circle cx="36" cy="36" r="30" fill="#25262A" stroke="#424751" stroke-width="2"/>
-          <circle id="ctxArc" cx="36" cy="36" r="24" fill="none" stroke="#CCE829" stroke-width="4"
-            stroke-linecap="round" stroke-dasharray="150" stroke-dashoffset="75"
-            transform="rotate(-90 36 36)" style="transition:stroke-dashoffset .3s ease"/>
+          <circle cx="36" cy="36" r="30" fill="#25262A" stroke="#424751" stroke-width="2"></circle>
+          <circle id="ctxArc" cx="36" cy="36" r="24" fill="none" stroke="#CCE829" stroke-width="4" stroke-linecap="round" stroke-dasharray="150" stroke-dashoffset="75" transform="rotate(-90 36 36)" style="transition:stroke-dashoffset .3s ease"></circle>
         </svg>
         <div class="tuner-center"><div class="tuner-val" id="ctxVal">2K</div></div>
       </div>
@@ -345,42 +338,42 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
   <div class="metric-card">
     <div class="donut-wrap">
       <svg class="donut-svg" viewBox="0 0 48 48">
-        <circle class="donut-track" cx="24" cy="24" r="20"/>
-        <circle class="donut-fill blue" id="cpuRing" cx="24" cy="24" r="20"/>
+        <circle class="donut-track" cx="24" cy="24" r="20"></circle>
+        <circle class="donut-fill blue" id="cpuRing" cx="24" cy="24" r="20" style="stroke-dashoffset: 83.2646;"></circle>
       </svg>
-      <div class="donut-pct" id="cpuPct">—</div>
+      <div class="donut-pct" id="cpuPct">34%</div>
     </div>
     <div class="metric-info">
       <div class="metric-type">CPU Load</div>
-      <div class="metric-value" id="cpuVal">—</div>
+      <div class="metric-value" id="cpuVal">34%</div>
       <div class="metric-status" id="cpuStatus">Idle</div>
     </div>
   </div>
   <div class="metric-card">
     <div class="donut-wrap">
       <svg class="donut-svg" viewBox="0 0 48 48">
-        <circle class="donut-track" cx="24" cy="24" r="20"/>
-        <circle class="donut-fill lav" id="ramRing" cx="24" cy="24" r="20"/>
+        <circle class="donut-track" cx="24" cy="24" r="20"></circle>
+        <circle class="donut-fill lav" id="ramRing" cx="24" cy="24" r="20" style="stroke-dashoffset: 54.1438;"></circle>
       </svg>
-      <div class="donut-pct" id="ramPct">—</div>
+      <div class="donut-pct" id="ramPct">57%</div>
     </div>
     <div class="metric-info">
       <div class="metric-type">System RAM</div>
-      <div class="metric-value" id="ramVal">— <span>/ 8 GB</span></div>
+      <div class="metric-value" id="ramVal">4.4 <span>/ 8 GB</span></div>
       <div class="metric-status" id="ramStatus">—</div>
     </div>
   </div>
   <div class="airgap">
-    <div class="airgap-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.657 16.657L13.414 20.9a2 2 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><path d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/><line x1="1" y1="1" x2="23" y2="23" stroke-width="2"/></svg></div>
+    <div class="airgap-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.657 16.657L13.414 20.9a2 2 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path><line x1="1" y1="1" x2="23" y2="23" stroke-width="2"></line></svg></div>
     <div><div class="airgap-title">Air-gapped session</div><div class="airgap-desc">Network access blocked. 0 bytes transmitted this session.</div></div>
   </div>
   <div class="rail-config">
-    <input class="srv-input" id="srvUrl" value="http://127.0.0.1:7474"/>
+    <input class="srv-input" id="srvUrl" value="http://127.0.0.1:7474">
     <button class="conn-btn" onclick="checkHealth()">Connect</button>
   </div>
   <div class="model-state">
     <div class="ms-label">Model State</div>
-    <div class="ms-val" id="modelState">NOT LOADED</div>
+    <div class="ms-val" id="modelState">LOADED</div>
   </div>
 </aside>
 </div>
@@ -476,6 +469,29 @@ function updateGauge(tps){
   makeDrag('rightDrag','rail','right');
 })();
 
+// ── File attachment ──
+let attachedFileContent = null;
+let attachedFileName = null;
+
+function handleFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    attachedFileContent = e.target.result;
+    attachedFileName = file.name;
+    document.getElementById('attachLabel').textContent = '📄 ' + file.name.slice(0, 20) + (file.name.length > 20 ? '...' : '');
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
+
+function clearAttachment() {
+  attachedFileContent = null;
+  attachedFileName = null;
+  document.getElementById('attachLabel').textContent = 'Attach';
+}
+
 // ── Model switch ──
 async function switchModel(m){
   currentModel = m;
@@ -539,7 +555,12 @@ function fmtTime(ts){const d=new Date(ts);return d.getHours().toString().padStar
 async function sendMsg(){
   if(isGenerating)return;
   const inp=document.getElementById('promptInput');
-  const text=inp.value.trim(); if(!text)return;
+  let text=inp.value.trim(); if(!text && !attachedFileContent)return;
+  if(attachedFileContent){
+    const fileCtx = '--- Attached file: '+attachedFileName+' ---\n'+attachedFileContent.slice(0,8000)+(attachedFileContent.length>8000?'\n[truncated]':'')+'\n--- End of file ---\n\n';
+    text = fileCtx + (text || 'Please analyze the attached file.');
+    clearAttachment();
+  }
   document.getElementById('emptyState').style.display='none';
   const ts=Date.now();
   currentSession.messages.push({role:'user',text,ts,starred:false});
@@ -607,7 +628,7 @@ function renderMsgs(){
       wrap.className='msg-wrap user-wrap';
       wrap.innerHTML=`<div class="msg-meta">${star}<span>${fmtTime(msg.ts)}</span></div><div class="msg-user">${esc(msg.text)}</div>`;
     } else {
-      const MODEL_LABELS={'qwen2.5-coder-3b':'Qwen2.5-Coder 3B','qwen2.5-coder-1.5b':'Qwen2.5-Coder 1.5B','qwen35-4b':'Qwen3.5 4B','phi-3-mini':'Phi-3-mini','llama-3.1-8b':'Llama 3.1 8B'};
+      const MODEL_LABELS={'qwen2.5-coder-3b-abl':'Qwen2.5-Coder 3B Abliterated','qwen2.5-coder-3b':'Qwen2.5-Coder 3B','qwen2.5-coder-1.5b':'Qwen2.5-Coder 1.5B','llama-3.2-3b-uncensored':'Llama 3.2 3B Uncensored','phi-3-mini':'Phi-3-mini','llama-3.1-8b':'Llama 3.1 8B'};
       const ml=MODEL_LABELS[currentModel]||currentModel;
       wrap.className='msg-wrap ai-wrap';
       wrap.innerHTML=`<div class="msg-ai-wrap"><div class="msg-ai-header"><div class="ai-avatar">QF</div><div class="ai-name">${ml}</div>${msg.tps?`<span class="ai-tps">${msg.tps.toFixed(2)} tok/s</span>`:''}</div><div class="msg-ai-body">${md(msg.text)}</div><div class="msg-actions"><button class="action-btn" onclick="cpTxt(this,'${ea(msg.text)}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>Copy</button><div class="msg-meta" style="margin-left:auto">${star}<span>${fmtTime(msg.ts)}</span></div></div></div>`;
@@ -703,5 +724,6 @@ document.getElementById('srvUrl').addEventListener('change',e=>SERVER=e.target.v
 renderHist(); renderMsgs(); updateTelemetry();
 setInterval(updateTelemetry,3000);
 </script>
-</body>
-</html>
+
+
+</body></html>
