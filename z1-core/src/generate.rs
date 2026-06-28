@@ -132,7 +132,7 @@ impl ChatTemplate {
                 sys.extend_from_slice(&tok.encode_no_bos("<|end|>\n"));
                 sys
             }
-            "qwen2" => {
+            "qwen2" | "qwen" => {
                 // Qwen2 template: <|im_start|>system\n{content}<|im_end|>\n
                 let mut sys = Vec::new();
                 sys.extend_from_slice(&tok.encode_no_bos("<|im_start|>system\n"));
@@ -171,7 +171,7 @@ impl ChatTemplate {
                 turn.extend_from_slice(&tok.encode_no_bos("<|assistant|>\n"));
                 turn
             }
-            "qwen2" => {
+            "qwen2" | "qwen" => {
                 // <|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n
                 let mut turn = Vec::new();
                 turn.extend_from_slice(&tok.encode_no_bos("<|im_start|>user\n"));
@@ -195,7 +195,7 @@ impl ChatTemplate {
                 let ids = tok.encode_no_bos("<|end|>");
                 ids.first().copied().unwrap_or(32007)
             }
-            "qwen2" => {
+            "qwen2" | "qwen" => {
                 let ids = tok.encode_no_bos("<|im_end|>");
                 ids.first().copied().unwrap_or(151645)
             }

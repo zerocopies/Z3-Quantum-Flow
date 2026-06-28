@@ -229,10 +229,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--on);font-
       <button class="tab">Datasets</button>
     </div>
     <div style="display:flex;align-items:center;gap:8px">
-      <select id="modelSelect" onchange="currentModel=this.value" style="background:#252E40;border:1px solid #3A4454;border-radius:8px;padding:7px 12px;font-family:inherit;font-size:13px;color:#F8FAFC;cursor:pointer;outline:none;min-width:180px">
+      <select id="modelSelect" onchange="switchModel(this.value)" style="background:#252E40;border:1px solid #3A4454;border-radius:8px;padding:7px 12px;font-family:inherit;font-size:13px;color:#F8FAFC;cursor:pointer;outline:none;min-width:180px">
         <option value="qwen2.5-coder-3b">Qwen2.5-Coder 3B</option>
         <option value="qwen2.5-coder-1.5b">Qwen2.5-Coder 1.5B</option>
-        <option value="qwen35-4b">Qwen3.5 4B</option>
         <option value="phi-3-mini">Phi-3-mini</option>
         <option value="llama-3.1-8b">Llama 3.1 8B</option>
       </select>
@@ -477,6 +476,32 @@ function updateGauge(tps){
   makeDrag('rightDrag','rail','right');
 })();
 
+// ── Model switch ──
+async function switchModel(m){
+  currentModel = m;
+  document.getElementById('modelState').textContent = 'LOADING...';
+  try {
+    const paths = {
+      'qwen2.5-coder-3b': '/home/prp/Z3-Quantum-Flow/ai_playground/qwen2.5-coder-3b-q4_K_M.gguf',
+      'qwen2.5-coder-1.5b': '/home/prp/Z3-Quantum-Flow/ai_playground/qwen2.5-coder-1.5b-q4_K_M.gguf',
+      'qwen35-4b': '/home/prp/Z3-Quantum-Flow/ai_playground/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf',
+      'phi-3-mini': '/home/prp/Z3-Quantum-Flow/ai_playground/phi-3-mini-q4_K_M.gguf',
+      'llama-3.1-8b': '/home/prp/Z3-Quantum-Flow/ai_playground/llama-3.1-8b-instruct-q4_k_m_lmu.gguf',
+    };
+    const res = await fetch(SERVER+'/load_model', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: paths[m]})
+    });
+    const data = await res.json();
+    document.getElementById('modelState').textContent = 'LOADED';
+    // Reset session for new model
+    window.bzSession = null;
+  } catch(e) {
+    document.getElementById('modelState').textContent = 'ERROR';
+  }
+}
+
 // ── Panel collapse ──
 function togglePanel(id){
   const el=document.getElementById(id);
@@ -582,7 +607,8 @@ function renderMsgs(){
       wrap.className='msg-wrap user-wrap';
       wrap.innerHTML=`<div class="msg-meta">${star}<span>${fmtTime(msg.ts)}</span></div><div class="msg-user">${esc(msg.text)}</div>`;
     } else {
-      const ml=currentModel==='qwen2.5-coder-3b'?'Qwen2.5-Coder 3B':currentModel==='phi-3-mini'?'Phi-3-mini':'Llama 3.1 8B';
+      const MODEL_LABELS={'qwen2.5-coder-3b':'Qwen2.5-Coder 3B','qwen2.5-coder-1.5b':'Qwen2.5-Coder 1.5B','qwen35-4b':'Qwen3.5 4B','phi-3-mini':'Phi-3-mini','llama-3.1-8b':'Llama 3.1 8B'};
+      const ml=MODEL_LABELS[currentModel]||currentModel;
       wrap.className='msg-wrap ai-wrap';
       wrap.innerHTML=`<div class="msg-ai-wrap"><div class="msg-ai-header"><div class="ai-avatar">QF</div><div class="ai-name">${ml}</div>${msg.tps?`<span class="ai-tps">${msg.tps.toFixed(2)} tok/s</span>`:''}</div><div class="msg-ai-body">${md(msg.text)}</div><div class="msg-actions"><button class="action-btn" onclick="cpTxt(this,'${ea(msg.text)}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>Copy</button><div class="msg-meta" style="margin-left:auto">${star}<span>${fmtTime(msg.ts)}</span></div></div></div>`;
     }

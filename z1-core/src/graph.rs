@@ -106,7 +106,7 @@ impl ModelDNA {
             n_rot: { let r = get_u32(&format!("{}.rope.dimension_count", arch)); if r == 0 { get_u32(&format!("{}.embedding_length", arch)) / get_u32(&format!("{}.attention.head_count", arch)).max(1) } else { r } },
             freq_base:        get_f32(&format!("{}.rope.freq_base", arch), 10000.0),
             rms_eps:          get_f32(&format!("{}.attention.layer_norm_rms_epsilon", arch), 1e-6),
-            has_tied_weights: has_tied || arch == "qwen2",
+            has_tied_weights: has_tied || arch == "qwen2" || arch == "qwen",
         })
     }
 
@@ -385,11 +385,11 @@ impl ForwardPass {
             // RoPE
             let q = unsafe {
                 ffi::ggml_rope_ext(self.ctx, q, self.d_pos, null_mut(),
-                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" || hp.arch == "qwen" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
             };
             let k = unsafe {
                 ffi::ggml_rope_ext(self.ctx, k, self.d_pos, null_mut(),
-                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" || hp.arch == "qwen" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
             };
 
             // Flatten for cache write
@@ -648,11 +648,11 @@ impl ForwardPass {
             // RoPE
             let q = unsafe {
                 ffi::ggml_rope_ext(self.ctx, q, self.d_pos, null_mut(),
-                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" || hp.arch == "qwen" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
             };
             let k = unsafe {
                 ffi::ggml_rope_ext(self.ctx, k, self.d_pos, null_mut(),
-                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
+                    hp.n_rot as c_int, if hp.arch == "phi3" || hp.arch == "qwen2" || hp.arch == "qwen" { 2 } else { 0 }, 131072, hp.freq_base, 1.0, 0.0, 1.0, 32.0, 1.0)
             };
 
             let k_flat = unsafe {
